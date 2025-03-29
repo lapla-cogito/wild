@@ -40,5 +40,8 @@ tempfile = "3.19.1"
 which = "7.0.2"
 ascii_table = "4.0.6"
 
+[dev-dependencies]
+toml = "0.8.20"
+
 [lints]
 workspace = true

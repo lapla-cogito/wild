@@ -715,6 +715,7 @@ dependencies = [
  "rayon",
  "symbolic-demangle",
  "tempfile",
+ "toml",
  "tracing",
  "tracing-subscriber",
  "which",

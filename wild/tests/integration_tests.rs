@@ -415,6 +415,23 @@ struct Config {
     requires_glibc: bool,
     requires_clang_with_tlsdesc: bool,
     version_script: Option<PathBuf>,
+    rustc_channel: RustcChannel,
+    cross_compile: bool,
+}
+
+#[derive(serde::Deserialize)]
+struct TestConfig {
+    // These configs are used by the config file specified in `$WILD_TEST_CONFIG`
+    rustc_channel: RustcChannel,
+    cross_compile: bool,
+}
+
+#[derive(Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum RustcChannel {
+    Stable,
+    Beta,
+    Nightly,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -580,6 +597,8 @@ impl Default for Config {
             requires_glibc: false,
             requires_clang_with_tlsdesc: false,
             version_script: None,
+            rustc_channel: RustcChannel::Nightly,
+            cross_compile: false,
         }
     }
 }
@@ -742,6 +761,33 @@ fn parse_configs(src_filename: &Path) -> Result<Vec<Config>> {
             }
         }
     }
+
+    // parse configs specified in `$WILD_TEST_CONFIG`
+    if let Ok(config_path) = std::env::var("WILD_TEST_CONFIG") {
+        let config_path = Path::new(&config_path);
+        if config_path.exists() {
+            let config_content = std::fs::read_to_string(config_path).with_context(|| {
+                format!(
+                    "Failed to read WILD_TEST_CONFIG file at `{}`",
+                    config_path.display()
+                )
+            })?;
+            let data: TestConfig = match toml::from_str(&config_content) {
+                Ok(d) => d,
+                Err(_) => {
+                    bail!("Unable to load config from {:?}", config_path);
+                }
+            };
+            config.rustc_channel = data.rustc_channel;
+            config.cross_compile = data.cross_compile;
+        } else {
+            eprintln!(
+                "Warning: WILD_TEST_CONFIG file does not exist at `{}`",
+                config_path.display()
+            );
+        }
+    }
+
     let mut configs = config_by_name
         .into_values()
         .filter(|c| !c.is_abstract)
@@ -1072,10 +1118,15 @@ fn build_obj(
         }
         CompilerKind::Rust => {
             let wild = wild_path().to_str().context("Need UTF-8 path")?.to_owned();
+            let rustc_channel = match config.rustc_channel {
+                RustcChannel::Stable => "+stable",
+                RustcChannel::Beta => "+beta",
+                RustcChannel::Nightly => "+nightly",
+            };
 
             command
                 .env("WILD_SAVE_SKIP_LINKING", "1")
-                .arg("+nightly")
+                .arg(rustc_channel)
                 .args(["-C", "linker=clang"])
                 .args(["-C", &format!("link-arg=--ld-path={wild}")]);
 
@@ -2198,6 +2249,9 @@ fn integration_test(
         let config_it = configs.iter().filter(|config| !config.should_skip(arch));
 
         for config in config_it {
+            if arch != host_arch && !config.cross_compile {
+                continue;
+            }
             run_with_config(&program_inputs, config, arch, &linkers)?
         }
     }
