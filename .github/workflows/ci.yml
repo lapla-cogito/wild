@@ -66,16 +66,7 @@ jobs:
         with:
           targets: x86_64-unknown-linux-gnu,x86_64-unknown-linux-musl,aarch64-unknown-linux-gnu,aarch64-unknown-linux-musl
           components: rustc-codegen-cranelift-preview
-      - uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-          key: ${{ runner.os }}-${{ matrix.container }}-${{ matrix.runs-on }}-cargo-${{ steps.rust-toolchain.outputs.cachekey }}-${{ hashFiles('**/Cargo.lock') }}
-        if: ${{ !contains(matrix.container, 'alpine') }}
+      - uses: Swatinem/rust-cache@v2
       - run: cargo build --profile ci --workspace --no-default-features
       - run: WILD_TEST_CROSS=$WILD_TEST_CROSS cargo test --profile ci --workspace
 
@@ -92,15 +83,7 @@ jobs:
       id: rust-toolchain
       with:
         components: clippy
-    - uses: actions/cache@v4
-      with:
-        path: |
-          ~/.cargo/bin/
-          ~/.cargo/registry/index/
-          ~/.cargo/registry/cache/
-          ~/.cargo/git/db/
-          target/
-        key: ${{ runner.os }}-clippy-${{ steps.rust-toolchain.outputs.cachekey }}-${{ hashFiles('**/Cargo.lock') }}
+    - uses: Swatinem/rust-cache@v2
     - run: cargo clippy --workspace --target x86_64-unknown-linux-gnu
 
   rustfmt:
