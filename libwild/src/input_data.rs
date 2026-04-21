@@ -447,12 +447,66 @@ impl<'data> FileLoader<'data> {
 fn process_linker_script<'data>(
     input_file: &'data InputFile,
     args: &impl platform::Args,
+    inputs_arena: &'data Arena<InputFile>,
 ) -> Result<LoadedLinkerScript<'data>> {
     let bytes = input_file.data();
-    let script = LinkerScript::parse(bytes, &input_file.filename)?;
+    let mut script = LinkerScript::parse(bytes, &input_file.filename)?;
 
     let script_path = std::fs::canonicalize(&input_file.filename)?;
     let directory = script_path.parent().expect("expected an absolute path");
+
+    script.expand_includes(
+        &mut |filename, referrer| {
+            let filename_str =
+                std::str::from_utf8(filename).context("Invalid UTF-8 in INCLUDE filename")?;
+            let filename_path = Path::new(filename_str);
+            let referrer_dir = referrer.parent().expect("expected an absolute path");
+
+            let resolved = if filename_path.is_absolute() {
+                if filename_path.exists() {
+                    filename_path.to_path_buf()
+                } else {
+                    bail!("INCLUDE: file `{filename_str}` not found");
+                }
+            } else {
+                let local = referrer_dir.join(filename_path);
+                if local.exists() {
+                    local
+                } else if let Some(p) = search_for_file(args.lib_search_path(), None, filename_path)
+                {
+                    p
+                } else {
+                    bail!(
+                        "INCLUDE: file `{filename_str}` not found in script directory `{}` \
+                         or library search path",
+                        referrer_dir.display()
+                    );
+                }
+            };
+
+            let canonical = std::fs::canonicalize(&resolved).with_context(|| {
+                format!(
+                    "Failed to canonicalize INCLUDE file `{}`",
+                    resolved.display()
+                )
+            })?;
+
+            let data =
+                FileData::new(&canonical, args.common().prepopulate_maps).with_context(|| {
+                    format!("Failed to read INCLUDE file `{}`", canonical.display())
+                })?;
+
+            let included_file = inputs_arena.alloc(InputFile {
+                filename: canonical.clone(),
+                original_filename: PathBuf::from(filename_str),
+                modifiers: Default::default(),
+                data: Some(data),
+            });
+
+            Ok((included_file.data(), canonical))
+        },
+        &script_path,
+    )?;
 
     let mut extra_inputs = Vec::new();
 
@@ -618,7 +672,7 @@ impl<'data, P: Platform> TemporaryState<'data, P> {
             FileKind::Archive => process_archive(input_file, &Arc::new(file), self),
             FileKind::ThinArchive => process_thin_archive(input_file, self),
             FileKind::Text => {
-                let script = process_linker_script(input_file, self.args)?;
+                let script = process_linker_script(input_file, self.args, self.inputs_arena)?;
 
                 let file_indexes = script
                     .extra_inputs

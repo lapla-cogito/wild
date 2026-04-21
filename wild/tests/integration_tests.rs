@@ -1319,7 +1319,9 @@ fn process_directive(
             if is_rust {
                 bail!("LinkArgs is not used when building Rust code");
             }
-            let arg = &arg.replace("$OUT_DIR", &config.build_dir().display().to_string());
+            let arg = &arg
+                .replace("$OUT_DIR", &config.build_dir().display().to_string())
+                .replace("$SRC_DIR", &config.test_src_dir.display().to_string());
             if let Some((_, rest)) = arg.split_once("./") {
                 let filename = rest.split_once(' ').map_or(rest, |(f, _)| f);
                 let src_path = config.test_src_dir.join(filename);

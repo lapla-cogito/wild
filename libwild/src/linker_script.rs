@@ -75,6 +75,8 @@ pub(crate) enum Command<'a> {
     Provide(ProvideSymbolDefinition<'a>),
     Assert(AssertCommand<'a>),
     Memory(Vec<MemoryRegion<'a>>),
+    #[debug("INCLUDE {}", String::from_utf8_lossy(_0))]
+    Include(&'a [u8]),
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -246,6 +248,59 @@ impl<'data> LinkerScript<'data> {
             _ => None,
         })
     }
+
+    /// Recursively expands `INCLUDE` directives.
+    pub(crate) fn expand_includes(
+        &mut self,
+        resolver: &mut impl FnMut(&[u8], &Path) -> Result<(&'data [u8], std::path::PathBuf)>,
+        current_path: &Path,
+    ) -> Result {
+        let mut visited = vec![current_path.to_path_buf()];
+        self.commands =
+            expand_includes_in(std::mem::take(&mut self.commands), resolver, &mut visited)?;
+        Ok(())
+    }
+}
+
+fn expand_includes_in<'data>(
+    commands: Vec<Command<'data>>,
+    resolver: &mut impl FnMut(&[u8], &Path) -> Result<(&'data [u8], std::path::PathBuf)>,
+    visited: &mut Vec<std::path::PathBuf>,
+) -> Result<Vec<Command<'data>>> {
+    let mut result = Vec::with_capacity(commands.len());
+    for command in commands {
+        match command {
+            Command::Include(filename) => {
+                let referrer = visited.last().expect("visited stack is non-empty");
+                let (bytes, canonical) = resolver(filename, referrer)?;
+
+                if visited.iter().any(|v| v == &canonical) {
+                    return Err(error!(
+                        "INCLUDE: circular include detected for `{}`",
+                        canonical.display()
+                    ));
+                }
+
+                let included = LinkerScript::parse(bytes, &canonical)?;
+
+                visited.push(canonical);
+                let expanded = expand_includes_in(included.commands, resolver, visited)?;
+                visited.pop();
+                result.extend(expanded);
+            }
+            Command::Group(subs) => {
+                result.push(Command::Group(expand_includes_in(subs, resolver, visited)?));
+            }
+            Command::AsNeeded(subs) => {
+                result.push(Command::AsNeeded(expand_includes_in(
+                    subs, resolver, visited,
+                )?));
+            }
+            other => result.push(other),
+        }
+    }
+
+    Ok(result)
 }
 
 fn parse_token<'input>(input: &mut &'input BStr) -> winnow::Result<&'input [u8]> {
@@ -305,6 +360,11 @@ fn parse_command<'input>(input: &mut &'input BStr) -> winnow::Result<Command<'in
         b"PROVIDE_HIDDEN" => Command::Provide(parse_provide(input, true)?),
         b"ASSERT" => Command::Assert(parse_assert(input)?),
         b"MEMORY" => Command::Memory(parse_memory(input)?),
+        b"INCLUDE" => {
+            let filename = parse_token(input)?;
+            opt(';').parse_next(input)?;
+            Command::Include(filename)
+        }
         other => {
             if input.starts_with(b"=") {
                 // Symbol definition

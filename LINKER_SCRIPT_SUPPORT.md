@@ -12,7 +12,7 @@ end lists the features required to link the Linux kernel.
 | `GROUP(files...)` | ✅ | |
 | `INPUT(files...)` | ✅ | |
 | `AS_NEEDED(files...)` | ✅ | |
-| `INCLUDE(file)` | 📅 | |
+| `INCLUDE(file)` | ✅ | |
 | `OUTPUT_FORMAT(...)` | ✅ | Parsed and ignored |
 | `OUTPUT_ARCH(arch)` | ❌ | |
 | `OUTPUT(filename)` | ❌ | |
