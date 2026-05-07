@@ -16,6 +16,7 @@ jobs:
 
       - name: Update Formula
         run: |
+          set -euo pipefail
           VERSION=${{ github.event.release.tag_name }}
 
           gh release download $VERSION -R ${{ github.repository }} \

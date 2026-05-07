@@ -75,6 +75,7 @@ jobs:
       - name: Switch to linking with wild
         if: matrix.build != 'zigbuild' # zigbuild ignores this config
         run: |
+          set -euo pipefail
           mkdir -p "$HOME/.cargo"
           WILD="${PWD}/target/release/wild"
           $WILD --version
@@ -86,6 +87,7 @@ jobs:
 
       - name: Create tarballs
         run: |
+          set -euo pipefail
           n="wild-linker-${VERSION_TAG}-${{ matrix.target }}"
           mkdir "$n"
           cp "target/${{ matrix.target }}/dist/wild" "$n"
