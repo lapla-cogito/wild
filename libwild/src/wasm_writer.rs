@@ -13,7 +13,7 @@ use crate::wasm::WASM_MAGIC;
 use crate::wasm::WASM_VERSION;
 use crate::wasm::Wasm;
 use crate::wasm::WasmDataSegmentLayout;
-use crate::wasm::WasmFunctionBody;
+use crate::wasm::WasmFunctionBodyLayout;
 use crate::wasm::WasmLayout;
 use crate::wasm::WasmObjectIndexMap;
 use crate::wasm::WasmRelocation;
@@ -162,7 +162,8 @@ fn copy_encoded_section(encoded: Option<&Vec<u8>>, out: &mut [u8]) -> Result<()>
     Ok(())
 }
 
-// Each `WasmFunctionBody.bytes` is the raw body content (locals + operators) without a size prefix.
+// Each `WasmFunctionBodyLayout.bytes` is the raw body content (locals + operators) without a size
+// prefix.
 fn write_code_section(wasm_layout: &WasmLayout<'_>, out: &mut [u8]) -> Result<()> {
     let bodies = &wasm_layout.function_bodies;
     let object_index_maps = &wasm_layout.object_index_maps;
@@ -201,7 +202,8 @@ fn write_code_section(wasm_layout: &WasmLayout<'_>, out: &mut [u8]) -> Result<()
     let bodies_region_start = pos;
 
     // Split the body region into non-overlapping slots, then emit in parallel.
-    let mut body_slots: Vec<(&mut [u8], &WasmFunctionBody<'_>)> = Vec::with_capacity(bodies.len());
+    let mut body_slots: Vec<(&mut [u8], &WasmFunctionBodyLayout<'_>)> =
+        Vec::with_capacity(bodies.len());
     {
         verbose_timing_phase!("Split Wasm code body slots");
         let mut rest = &mut out[bodies_region_start..];

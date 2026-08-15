@@ -26,6 +26,7 @@ use crate::wasm_writer::OutputExport;
 use crate::wasm_writer::OutputGlobal;
 use crate::wasm_writer::OutputImport;
 use crate::wasm_writer::OutputImportEntity;
+use crate::wasm_writer::const_expr_body;
 use hashbrown::HashMap;
 use hashbrown::HashSet;
 use leb128::write::signed_len as sleb128_size;
@@ -249,6 +250,34 @@ pub(crate) struct File<'data> {
     pub(crate) num_defined_functions: u32,
     pub(crate) num_defined_globals: u32,
     pub(crate) num_data_segments: u32,
+
+    #[debug(skip)]
+    types: Vec<wasmparser::FuncType>,
+    #[debug(skip)]
+    function_imports: Vec<WasmFunctionImport<'data>>,
+    #[debug(skip)]
+    global_imports: Vec<WasmGlobalImport<'data>>,
+    #[debug(skip)]
+    memory_imports: Vec<MemoryType>,
+    #[debug(skip)]
+    table_imports: Vec<wasmparser::TableType>,
+    /// Type indices of defined functions, in `function` section order.
+    #[debug(skip)]
+    module_functions: Vec<u32>,
+    #[debug(skip)]
+    module_globals: Vec<OutputGlobal<'data>>,
+    #[debug(skip)]
+    memories: Vec<MemoryType>,
+    #[debug(skip)]
+    exports: Vec<OutputExport<'data>>,
+    #[debug(skip)]
+    function_bodies: Vec<WasmFunctionBody<'data>>,
+    #[debug(skip)]
+    data_segments: Vec<WasmDataSegment<'data>>,
+    #[debug(skip)]
+    function_body_spans: Vec<(u32, u32)>,
+    #[debug(skip)]
+    data_segment_spans: Vec<(u32, u32)>,
 }
 
 /// One entry of the Wasm tool-conventions `target_features` custom section.
@@ -574,13 +603,6 @@ pub(crate) struct WasmGlobalImport<'data> {
     pub(crate) ty: GlobalType,
 }
 
-/// A global defined inside the module (not imported).
-#[derive(Debug, Clone)]
-pub(crate) struct WasmModuleGlobal<'data> {
-    pub(crate) ty: GlobalType,
-    pub(crate) init_expr: ConstExpr<'data>,
-}
-
 /// A single data segment from the `data` section.
 #[derive(Debug, Clone)]
 pub(crate) struct WasmDataSegment<'data> {
@@ -588,6 +610,7 @@ pub(crate) struct WasmDataSegment<'data> {
     pub(crate) data: &'data [u8],
     /// Byte offset of this segment's encoding within the input data section payload.
     pub(crate) section_offset: u32,
+    pub(crate) encoded_size: u32,
 }
 
 /// Layout for one data segment within an input object.
@@ -607,7 +630,7 @@ pub(crate) struct WasmDataSegmentLayout<'data> {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct WasmFunctionBody<'data> {
+pub(crate) struct WasmFunctionBodyLayout<'data> {
     /// Raw body bytes (locals + operators) without the LEB128 size prefix.
     pub(crate) bytes: Cow<'data, [u8]>,
     /// Byte offset of this body (starting at its size prefix) within the code section payload.
@@ -616,6 +639,23 @@ pub(crate) struct WasmFunctionBody<'data> {
     pub(crate) relocations: Vec<WasmRelocation>,
     /// Index of the object this body belongs to.
     pub(crate) object_index: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct WasmFunctionBody<'data> {
+    bytes: &'data [u8],
+    code_offset: u32,
+}
+
+impl<'data> WasmFunctionBody<'data> {
+    fn to_layout_body(self) -> WasmFunctionBodyLayout<'data> {
+        WasmFunctionBodyLayout {
+            bytes: Cow::Borrowed(self.bytes),
+            code_offset: self.code_offset,
+            relocations: Vec::new(),
+            object_index: 0,
+        }
+    }
 }
 
 fn is_debug_section_name(name: &[u8]) -> bool {
@@ -635,155 +675,6 @@ impl<'data> File<'data> {
             .get(name_range.start as usize..name_range.end as usize)
             .unwrap_or_default();
         is_debug_section_name(name)
-    }
-
-    /// Construct a `BinaryReader` over the payload of the standard section with the given id,
-    /// or `None` if the input has no such section.
-    fn standard_section_reader(&self, id: u8) -> Option<BinaryReader<'data>> {
-        let section_index = self.standard_section_index.get(id as usize)?.as_ref()?;
-        let header = self.sections.get(*section_index as usize)?;
-        let payload = self.data.get(header.payload_range_usize())?;
-        Some(BinaryReader::new(
-            payload,
-            header.payload_range.start as usize,
-        ))
-    }
-
-    pub(crate) fn import_section_reader(&self) -> Result<Option<ImportSectionReader<'data>>> {
-        self.standard_section_reader(section_id::IMPORT)
-            .map(|r| ImportSectionReader::new(r).map_err(Into::into))
-            .transpose()
-    }
-
-    pub(crate) fn function_section_reader(&self) -> Result<Option<FunctionSectionReader<'data>>> {
-        self.standard_section_reader(section_id::FUNCTION)
-            .map(|r| FunctionSectionReader::new(r).map_err(Into::into))
-            .transpose()
-    }
-
-    pub(crate) fn global_section_reader(&self) -> Result<Option<GlobalSectionReader<'data>>> {
-        self.standard_section_reader(section_id::GLOBAL)
-            .map(|r| GlobalSectionReader::new(r).map_err(Into::into))
-            .transpose()
-    }
-
-    pub(crate) fn data_section_reader(&self) -> Result<Option<DataSectionReader<'data>>> {
-        self.standard_section_reader(section_id::DATA)
-            .map(|r| DataSectionReader::new(r).map_err(Into::into))
-            .transpose()
-    }
-
-    pub(crate) fn code_section_reader(&self) -> Result<Option<CodeSectionReader<'data>>> {
-        self.standard_section_reader(section_id::CODE)
-            .map(|r| CodeSectionReader::new(r).map_err(Into::into))
-            .transpose()
-    }
-
-    pub(crate) fn memory_section_reader(&self) -> Result<Option<MemorySectionReader<'data>>> {
-        self.standard_section_reader(section_id::MEMORY)
-            .map(|r| MemorySectionReader::new(r).map_err(Into::into))
-            .transpose()
-    }
-
-    pub(crate) fn export_section_reader(&self) -> Result<Option<ExportSectionReader<'data>>> {
-        self.standard_section_reader(section_id::EXPORT)
-            .map(|r| ExportSectionReader::new(r).map_err(Into::into))
-            .transpose()
-    }
-
-    pub(crate) fn type_section_reader(&self) -> Result<Option<TypeSectionReader<'data>>> {
-        self.standard_section_reader(section_id::TYPE)
-            .map(|r| TypeSectionReader::new(r).map_err(Into::into))
-            .transpose()
-    }
-
-    /// Type indices of functions defined in this module (excluding imports), in `function`
-    /// section order. The function body for each entry lives in the `code` section.
-    pub(crate) fn module_functions(&self) -> Result<Vec<u32>> {
-        let Some(reader) = self.function_section_reader()? else {
-            return Ok(Vec::new());
-        };
-
-        reader
-            .into_iter()
-            .map(|res| res.map_err(Into::into))
-            .collect()
-    }
-
-    /// Globals defined in this module (excluding imports), in `global` section order.
-    pub(crate) fn module_globals(&self) -> Result<Vec<WasmModuleGlobal<'data>>> {
-        let Some(reader) = self.global_section_reader()? else {
-            return Ok(Vec::new());
-        };
-
-        reader
-            .into_iter()
-            .map(|res| {
-                res.map(|g| WasmModuleGlobal {
-                    ty: g.ty,
-                    init_expr: g.init_expr,
-                })
-                .map_err(Into::into)
-            })
-            .collect()
-    }
-
-    pub(crate) fn memories(&self) -> Result<Vec<MemoryType>> {
-        let Some(reader) = self.memory_section_reader()? else {
-            return Ok(Vec::new());
-        };
-        reader
-            .into_iter()
-            .map(|res| res.map_err(Into::into))
-            .collect()
-    }
-
-    /// Function bodies in code-section order. The returned bytes include the body size prefix.
-    pub(crate) fn function_bodies(&self) -> Result<Vec<WasmFunctionBody<'data>>> {
-        let Some(reader) = self.code_section_reader()? else {
-            return Ok(Vec::new());
-        };
-        let code_payload_start = self.standard_section_index[section_id::CODE as usize]
-            .and_then(|i| self.sections.get(i as usize))
-            .map_or(0, |h| h.payload_range.start);
-        reader
-            .into_iter()
-            .map(|res| {
-                res.map(|body| {
-                    let range = body.range();
-                    WasmFunctionBody {
-                        bytes: Cow::Borrowed(&self.data[range.clone()]),
-                        code_offset: range.start as u32 - code_payload_start,
-                        relocations: Vec::new(),
-                        object_index: 0,
-                    }
-                })
-                .map_err(Into::into)
-            })
-            .collect()
-    }
-
-    /// Data segments in declaration order.
-    pub(crate) fn data_segments(&self) -> Result<Vec<WasmDataSegment<'data>>> {
-        let Some(reader) = self.data_section_reader()? else {
-            return Ok(Vec::new());
-        };
-
-        let mut segments = Vec::new();
-        let mut section_offset = u32::try_from(uleb128_size(u64::from(reader.count())))
-            .context("Wasm data count LEB")?;
-        for res in reader {
-            let d = res?;
-            segments.push(WasmDataSegment {
-                kind: d.kind.clone(),
-                data: d.data,
-                section_offset,
-            });
-            section_offset = section_offset
-                .checked_add(wasm_data_segment_encoded_size(&d.kind, d.data.len())?)
-                .ok_or_else(|| crate::error!("Wasm data section offset overflow"))?;
-        }
-        Ok(segments)
     }
 }
 
@@ -1554,7 +1445,7 @@ pub(crate) struct WasmLayout<'data> {
     pub(crate) function_type_indices: Vec<u32>,
     pub(crate) globals: Vec<OutputGlobal<'data>>,
     pub(crate) exports: Vec<OutputExport<'data>>,
-    pub(crate) function_bodies: Vec<WasmFunctionBody<'data>>,
+    pub(crate) function_bodies: Vec<WasmFunctionBodyLayout<'data>>,
     pub(crate) memories: Vec<MemoryType>,
     pub(crate) tables: Vec<wasmparser::TableType>,
     pub(crate) element_functions: Vec<u32>,
@@ -2026,7 +1917,7 @@ impl<'data> WasmLayout<'data> {
 }
 
 fn const_expr_encoded_size(expr: &ConstExpr<'_>) -> Result<u32> {
-    let body = crate::wasm_writer::const_expr_body(expr)
+    let body = const_expr_body(expr)
         .ok_or_else(|| crate::error!("Wasm const expression is missing end opcode"))?;
     // instruction bytes plus the trailing `end` (0x0B) opcode
     u32::try_from(body.len() + 1).context("Wasm const expression too large")
@@ -2116,14 +2007,6 @@ fn classify_data_relocations(
 
     let mut spans = Vec::with_capacity(segments.len());
     for segment in segments {
-        let Ok(encoded) = wasm_data_segment_encoded_size(&segment.kind, segment.data.len()) else {
-            spans.push(DataSegmentSpan {
-                start: 0,
-                end: 0,
-                payload_start: 0,
-            });
-            continue;
-        };
         let Ok(payload_rel) =
             data_segment_payload_offset_in_section(&segment.kind, segment.data.len())
         else {
@@ -2135,7 +2018,7 @@ fn classify_data_relocations(
             continue;
         };
         let start = segment.section_offset;
-        let end = start.saturating_add(encoded);
+        let end = start.saturating_add(segment.encoded_size);
         let payload_start = start.saturating_add(payload_rel);
         spans.push(DataSegmentSpan {
             start,
@@ -2284,7 +2167,7 @@ fn compute_data_section_size(object_data_layouts: &[Vec<WasmDataSegmentLayout<'_
     1 + payload_size_leb_size + payload_size
 }
 
-fn compute_code_section_size(bodies: &[WasmFunctionBody<'_>]) -> u64 {
+fn compute_code_section_size(bodies: &[WasmFunctionBodyLayout<'_>]) -> u64 {
     if bodies.is_empty() {
         return 0;
     }
@@ -2502,8 +2385,6 @@ pub(crate) struct WasmObjectLayout<'data> {
     relocs_ready: bool,
     code_relocations: Vec<WasmRelocation>,
     data_relocations: Vec<WasmRelocation>,
-    function_body_spans: Vec<(u32, u32)>,
-    data_segment_spans: Vec<(u32, u32)>,
     defined_function_live_ordinal: Vec<u32>,
     defined_global_live_ordinal: Vec<u32>,
     _phantom: std::marker::PhantomData<&'data ()>,
@@ -2611,8 +2492,6 @@ impl<'data> WasmObjectLayout<'data> {
             .unwrap_or_default();
         sort_relocations_by_offset(&mut data_relocations);
 
-        self.function_body_spans = compute_function_body_spans(file)?;
-        self.data_segment_spans = compute_data_segment_spans(file)?;
         self.code_relocations = code_relocations;
         self.data_relocations = data_relocations;
         self.relocs_ready = true;
@@ -2731,41 +2610,6 @@ fn relocs_in_offset_range(relocs: &[WasmRelocation], start: u32, end: u32) -> &[
     &relocs[reloc_index_range(relocs, start, end)]
 }
 
-fn compute_function_body_spans(file: &File<'_>) -> Result<Vec<(u32, u32)>> {
-    let Some(reader) = file.code_section_reader()? else {
-        return Ok(Vec::new());
-    };
-    let code_payload_start = file.standard_section_index[section_id::CODE as usize]
-        .and_then(|i| file.sections.get(i as usize))
-        .map_or(0, |h| h.payload_range.start as usize);
-    reader
-        .into_iter()
-        .map(|res| {
-            let body = res?;
-            let range = body.range();
-            let start = u32::try_from(range.start - code_payload_start)
-                .context("Wasm function body offset overflow")?;
-            let end = u32::try_from(range.end - code_payload_start)
-                .context("Wasm function body end overflow")?;
-            Ok((start, end))
-        })
-        .collect()
-}
-
-fn compute_data_segment_spans(file: &File<'_>) -> Result<Vec<(u32, u32)>> {
-    let segments = file.data_segments()?;
-    let mut spans = Vec::with_capacity(segments.len());
-    for segment in &segments {
-        let encoded = wasm_data_segment_encoded_size(&segment.kind, segment.data.len())?;
-        let start = segment.section_offset;
-        let end = start
-            .checked_add(encoded)
-            .ok_or_else(|| crate::error!("Wasm data segment span overflow"))?;
-        spans.push((start, end));
-    }
-    Ok(spans)
-}
-
 /// Map a linking symbol to its file-local GC unit, if any.
 fn wasm_gc_unit_for_symbol(file: &File<'_>, symbol: &WasmSymbol) -> Option<WasmGcUnit> {
     match symbol.kind {
@@ -2804,7 +2648,7 @@ struct WasmObjectLayoutInput<'data> {
     module_functions: Vec<u32>,
     globals: Vec<OutputGlobal<'data>>,
     exports: Vec<OutputExport<'data>>,
-    function_bodies: Vec<WasmFunctionBody<'data>>,
+    function_bodies: Vec<WasmFunctionBodyLayout<'data>>,
     memories: Vec<MemoryType>,
     unsupported_output: Vec<&'static str>,
     code_relocations: Vec<WasmRelocation>,
@@ -2834,7 +2678,7 @@ struct WasmObjectOutputLayout<'data> {
     function_type_indices: Vec<u32>,
     globals: Vec<OutputGlobal<'data>>,
     exports: Vec<OutputExport<'data>>,
-    function_bodies: Vec<WasmFunctionBody<'data>>,
+    function_bodies: Vec<WasmFunctionBodyLayout<'data>>,
     memories: Vec<MemoryType>,
     unsupported_output: Vec<&'static str>,
     index_map: WasmObjectIndexMap,
@@ -2854,50 +2698,11 @@ impl<'data> WasmObjectLayoutInput<'data> {
         let keep_all_globals = layout.all_defined_globals_live();
         let keep_all_data_segments = layout.all_data_segments_live();
 
-        let mut types = Vec::new();
-        if let Some(type_section) = file.type_section_reader()? {
-            for group in type_section {
-                for ty in group?.into_types() {
-                    let wasmparser::CompositeInnerType::Func(func) = ty.composite_type.inner else {
-                        bail!("Wasm non-function types are not emitted")
-                    };
-                    types.push(func);
-                }
-            }
-        }
-
-        let mut function_imports = Vec::new();
-        let mut global_imports = Vec::new();
-        let mut memory_imports = Vec::new();
-        let mut table_imports = Vec::new();
-        if let Some(imports) = file.import_section_reader()? {
-            for import in imports.into_imports() {
-                let import = import?;
-                match import.ty {
-                    TypeRef::Func(type_index) | TypeRef::FuncExact(type_index) => {
-                        function_imports.push(WasmFunctionImport {
-                            module: import.module,
-                            name: import.name,
-                            type_index,
-                        });
-                    }
-                    TypeRef::Global(ty) => {
-                        global_imports.push(WasmGlobalImport {
-                            module: import.module,
-                            name: import.name,
-                            ty,
-                        });
-                    }
-                    TypeRef::Table(ty) => {
-                        table_imports.push(ty);
-                    }
-                    TypeRef::Memory(memory) => {
-                        memory_imports.push(memory);
-                    }
-                    TypeRef::Tag(_) => bail!("Wasm tag imports are not emitted"),
-                }
-            }
-        }
+        let types = file.types.clone();
+        let function_imports = file.function_imports.clone();
+        let global_imports = file.global_imports.clone();
+        let memory_imports = file.memory_imports.clone();
+        let table_imports = file.table_imports.clone();
 
         let live_function_imports = if all_live {
             vec![true; function_imports.len()]
@@ -2964,36 +2769,18 @@ impl<'data> WasmObjectLayoutInput<'data> {
         if file.standard_section_index[section_id::START as usize].is_some() {
             unsupported_output.push("start");
         }
-        let all_data_segments = file.data_segments()?;
-        for segment in &all_data_segments {
+        let all_data_segments = &file.data_segments;
+        for segment in all_data_segments {
             if let DataKind::Passive = segment.kind {
                 unsupported_output.push("passive data segment");
                 break;
             }
         }
 
-        let all_module_functions = file.module_functions()?;
-        let all_function_bodies = file.function_bodies()?;
-        ensure!(
-            all_module_functions.len() == all_function_bodies.len(),
-            "Wasm function and code section counts differ"
-        );
-        let memories = file.memories()?;
-
-        let all_globals = file
-            .module_globals()?
-            .into_iter()
-            .map(|global| {
-                let init_expr_body = crate::wasm_writer::const_expr_body(&global.init_expr)
-                    .ok_or_else(|| {
-                        crate::error!("Wasm global initializer is missing end opcode")
-                    })?;
-                Ok(OutputGlobal {
-                    ty: global.ty,
-                    init_expr_body: Cow::Borrowed(init_expr_body),
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
+        let all_module_functions = &file.module_functions;
+        let all_function_bodies = &file.function_bodies;
+        let memories = file.memories.clone();
+        let all_globals = &file.module_globals;
 
         let defined_function_live_ordinal = if keep_all_functions {
             identity_ordinals(all_module_functions.len())
@@ -3007,19 +2794,22 @@ impl<'data> WasmObjectLayoutInput<'data> {
         };
 
         let (module_functions, function_bodies, code_relocations) = if keep_all_functions {
-            // All defined functions live.
             (
-                all_module_functions,
-                all_function_bodies,
+                all_module_functions.clone(),
+                all_function_bodies
+                    .iter()
+                    .copied()
+                    .map(WasmFunctionBody::to_layout_body)
+                    .collect(),
                 code_relocations_all,
             )
         } else {
             let mut module_functions = Vec::new();
             let mut function_bodies = Vec::new();
             let mut code_relocations = Vec::new();
-            for (i, (ty, body)) in all_module_functions
-                .into_iter()
-                .zip(all_function_bodies)
+            for (i, (&ty, &body)) in all_module_functions
+                .iter()
+                .zip(all_function_bodies.iter())
                 .enumerate()
             {
                 if !layout.is_defined_function_live(i) {
@@ -3033,19 +2823,20 @@ impl<'data> WasmObjectLayoutInput<'data> {
                     body_end,
                 ));
                 module_functions.push(ty);
-                function_bodies.push(body);
+                function_bodies.push(body.to_layout_body());
             }
             sort_relocations_by_offset(&mut code_relocations);
             (module_functions, function_bodies, code_relocations)
         };
 
         let globals = if keep_all_globals {
-            all_globals
+            all_globals.clone()
         } else {
             all_globals
-                .into_iter()
+                .iter()
                 .enumerate()
-                .filter_map(|(i, global)| layout.is_defined_global_live(i).then_some(global))
+                .filter(|&(i, _)| layout.is_defined_global_live(i))
+                .map(|(_, global)| global.clone())
                 .collect()
         };
 
@@ -3053,20 +2844,22 @@ impl<'data> WasmObjectLayoutInput<'data> {
             if keep_all_data_segments {
                 let n = all_data_segments.len();
                 let original_indices = (0..n as u32).collect();
-                (all_data_segments, original_indices, data_relocations_all)
+                (
+                    all_data_segments.clone(),
+                    original_indices,
+                    data_relocations_all,
+                )
             } else {
                 let mut data_segments = Vec::new();
                 let mut data_segment_original_indices = Vec::new();
                 let mut data_relocations = Vec::new();
-                for (i, segment) in all_data_segments.into_iter().enumerate() {
+                for (i, segment) in all_data_segments.iter().enumerate() {
                     if !layout.is_data_segment_live(i) {
                         continue;
                     }
-                    let encoded =
-                        wasm_data_segment_encoded_size(&segment.kind, segment.data.len())?;
                     let start = segment.section_offset;
                     let end = start
-                        .checked_add(encoded)
+                        .checked_add(segment.encoded_size)
                         .ok_or_else(|| crate::error!("Wasm data segment span overflow"))?;
                     data_relocations.extend_from_slice(relocs_in_offset_range(
                         &data_relocations_all,
@@ -3075,7 +2868,7 @@ impl<'data> WasmObjectLayoutInput<'data> {
                     ));
                     data_segment_original_indices
                         .push(u32::try_from(i).context("too many data segments")?);
-                    data_segments.push(segment);
+                    data_segments.push(segment.clone());
                 }
                 sort_relocations_by_offset(&mut data_relocations);
                 (
@@ -3085,17 +2878,7 @@ impl<'data> WasmObjectLayoutInput<'data> {
                 )
             };
 
-        let mut exports = Vec::new();
-        if let Some(export_section) = file.export_section_reader()? {
-            for export in export_section {
-                let export = export?;
-                exports.push(OutputExport {
-                    name: export.name,
-                    kind: export.kind,
-                    index: export.index,
-                });
-            }
-        }
+        let exports = file.exports.clone();
 
         Ok(Self {
             data: file.data,
@@ -5044,8 +4827,8 @@ fn deduplicate_output_types(layout: &mut WasmLayout<'_>) {
     }
 }
 
-fn borrowed_linker_function_body(bytes: &'static [u8]) -> WasmFunctionBody<'static> {
-    WasmFunctionBody {
+fn borrowed_linker_function_body(bytes: &'static [u8]) -> WasmFunctionBodyLayout<'static> {
+    WasmFunctionBodyLayout {
         bytes: Cow::Borrowed(bytes),
         code_offset: 0,
         relocations: Vec::new(),
@@ -5053,16 +4836,16 @@ fn borrowed_linker_function_body(bytes: &'static [u8]) -> WasmFunctionBody<'stat
     }
 }
 
-fn empty_linker_function_body() -> WasmFunctionBody<'static> {
+fn empty_linker_function_body() -> WasmFunctionBodyLayout<'static> {
     borrowed_linker_function_body(EMPTY_FUNCTION_BODY)
 }
 
-fn unreachable_linker_function_body() -> WasmFunctionBody<'static> {
+fn unreachable_linker_function_body() -> WasmFunctionBodyLayout<'static> {
     borrowed_linker_function_body(UNREACHABLE_FUNCTION_BODY)
 }
 
-fn owned_linker_function_body(bytes: Vec<u8>) -> WasmFunctionBody<'static> {
-    WasmFunctionBody {
+fn owned_linker_function_body(bytes: Vec<u8>) -> WasmFunctionBodyLayout<'static> {
+    WasmFunctionBodyLayout {
         bytes: Cow::Owned(bytes),
         code_offset: 0,
         relocations: Vec::new(),
@@ -6216,7 +5999,7 @@ fn allocate_wasm_object_index_bases(
 
 /// Classify code relocations into per-body groups with body-local offsets.
 fn classify_code_relocations<'data>(
-    bodies: &mut [WasmFunctionBody<'data>],
+    bodies: &mut [WasmFunctionBodyLayout<'data>],
     relocs: &[WasmRelocation],
 ) {
     if relocs.is_empty() {
@@ -6594,8 +6377,6 @@ impl platform::Platform for Wasm {
             relocs_ready: false,
             code_relocations: Vec::new(),
             data_relocations: Vec::new(),
-            function_body_spans: Vec::new(),
-            data_segment_spans: Vec::new(),
             defined_function_live_ordinal: Vec::new(),
             defined_global_live_ordinal: Vec::new(),
             _phantom: std::marker::PhantomData,
@@ -6945,27 +6726,28 @@ fn parse_wasm_module<'data>(input: &'data [u8]) -> Result<File<'data>> {
         });
     }
 
+    let parsed = parse_standard_sections(input, &standard_section_index, &sections)?;
+
     // Backfill names for unnamed undefined function/global symbols from the import section.
     // The Wasm linking convention allows symbol entries to omit the name when the symbol is
     // undefined; the canonical name lives in the import entry instead.
-    backfill_unnamed_import_symbols(input, &standard_section_index, &sections, &mut symbols)?;
+    backfill_unnamed_import_symbols(
+        input,
+        &parsed.function_imports,
+        &parsed.global_imports,
+        &mut symbols,
+    );
 
-    let (num_function_imports, num_global_imports) =
-        count_function_and_global_imports(input, &standard_section_index, &sections)?;
-    let num_defined_functions = section_entry_count(
-        input,
-        &standard_section_index,
-        &sections,
-        section_id::FUNCTION,
-    )?;
-    let num_defined_globals = section_entry_count(
-        input,
-        &standard_section_index,
-        &sections,
-        section_id::GLOBAL,
-    )?;
-    let num_data_segments =
-        section_entry_count(input, &standard_section_index, &sections, section_id::DATA)?;
+    let num_function_imports = u32::try_from(parsed.function_imports.len())
+        .map_err(|_| crate::error!("too many Wasm function imports"))?;
+    let num_global_imports = u32::try_from(parsed.global_imports.len())
+        .map_err(|_| crate::error!("too many Wasm global imports"))?;
+    let num_defined_functions = u32::try_from(parsed.module_functions.len())
+        .map_err(|_| crate::error!("too many Wasm functions"))?;
+    let num_defined_globals = u32::try_from(parsed.module_globals.len())
+        .map_err(|_| crate::error!("too many Wasm globals"))?;
+    let num_data_segments = u32::try_from(parsed.data_segments.len())
+        .map_err(|_| crate::error!("too many Wasm data segments"))?;
 
     Ok(File {
         data: input,
@@ -6981,64 +6763,231 @@ fn parse_wasm_module<'data>(input: &'data [u8]) -> Result<File<'data>> {
         num_defined_functions,
         num_defined_globals,
         num_data_segments,
+        types: parsed.types,
+        function_imports: parsed.function_imports,
+        global_imports: parsed.global_imports,
+        memory_imports: parsed.memory_imports,
+        table_imports: parsed.table_imports,
+        module_functions: parsed.module_functions,
+        module_globals: parsed.module_globals,
+        memories: parsed.memories,
+        exports: parsed.exports,
+        function_bodies: parsed.function_bodies,
+        data_segments: parsed.data_segments,
+        function_body_spans: parsed.function_body_spans,
+        data_segment_spans: parsed.data_segment_spans,
     })
 }
 
-fn count_function_and_global_imports(
-    data: &[u8],
-    standard_section_index: &[Option<u32>; STANDARD_SECTION_LOOKUP_LEN],
-    sections: &[SectionHeader],
-) -> Result<(u32, u32)> {
-    let Some(section_index) = standard_section_index[section_id::IMPORT as usize] else {
-        return Ok((0, 0));
-    };
-    let header = sections
-        .get(section_index as usize)
-        .ok_or_else(|| crate::error!("Wasm import section index out of range"))?;
-    let payload = data
-        .get(header.payload_range_usize())
-        .ok_or_else(|| crate::error!("Wasm import section payload out of bounds"))?;
-    let reader = ImportSectionReader::new(BinaryReader::new(
-        payload,
-        header.payload_range.start as usize,
-    ))?;
-    let mut num_function_imports = 0u32;
-    let mut num_global_imports = 0u32;
-    for import in reader.into_imports() {
-        match import?.ty {
-            TypeRef::Func(_) | TypeRef::FuncExact(_) => {
-                num_function_imports = num_function_imports
-                    .checked_add(1)
-                    .ok_or_else(|| crate::error!("too many Wasm function imports"))?;
-            }
-            TypeRef::Global(_) => {
-                num_global_imports = num_global_imports
-                    .checked_add(1)
-                    .ok_or_else(|| crate::error!("too many Wasm global imports"))?;
-            }
-            _ => {}
-        }
-    }
-    Ok((num_function_imports, num_global_imports))
+struct ParsedStandardSections<'data> {
+    types: Vec<wasmparser::FuncType>,
+    function_imports: Vec<WasmFunctionImport<'data>>,
+    global_imports: Vec<WasmGlobalImport<'data>>,
+    memory_imports: Vec<MemoryType>,
+    table_imports: Vec<wasmparser::TableType>,
+    module_functions: Vec<u32>,
+    module_globals: Vec<OutputGlobal<'data>>,
+    memories: Vec<MemoryType>,
+    exports: Vec<OutputExport<'data>>,
+    function_bodies: Vec<WasmFunctionBody<'data>>,
+    data_segments: Vec<WasmDataSegment<'data>>,
+    function_body_spans: Vec<(u32, u32)>,
+    data_segment_spans: Vec<(u32, u32)>,
 }
 
-fn section_entry_count(
-    data: &[u8],
+fn standard_section_reader<'data>(
+    data: &'data [u8],
     standard_section_index: &[Option<u32>; STANDARD_SECTION_LOOKUP_LEN],
     sections: &[SectionHeader],
-    section_id: u8,
-) -> Result<u32> {
-    let Some(section_index) = standard_section_index[section_id as usize] else {
-        return Ok(0);
-    };
-    let header = sections
-        .get(section_index as usize)
-        .ok_or_else(|| crate::error!("Wasm section index out of range"))?;
-    let payload = data
-        .get(header.payload_range_usize())
-        .ok_or_else(|| crate::error!("Wasm section payload out of bounds"))?;
-    let mut reader = BinaryReader::new(payload, header.payload_range.start as usize);
-    Ok(reader.read_var_u32()?)
+    id: u8,
+) -> Option<BinaryReader<'data>> {
+    let section_index = standard_section_index.get(id as usize)?.as_ref()?;
+    let header = sections.get(*section_index as usize)?;
+    let payload = data.get(header.payload_range_usize())?;
+    Some(BinaryReader::new(
+        payload,
+        header.payload_range.start as usize,
+    ))
+}
+
+fn parse_standard_sections<'data>(
+    data: &'data [u8],
+    standard_section_index: &[Option<u32>; STANDARD_SECTION_LOOKUP_LEN],
+    sections: &[SectionHeader],
+) -> Result<ParsedStandardSections<'data>> {
+    let mut types = Vec::new();
+    if let Some(reader) =
+        standard_section_reader(data, standard_section_index, sections, section_id::TYPE)
+    {
+        for group in TypeSectionReader::new(reader)? {
+            for ty in group?.into_types() {
+                let wasmparser::CompositeInnerType::Func(func) = ty.composite_type.inner else {
+                    bail!("Wasm non-function types are not emitted")
+                };
+                types.push(func);
+            }
+        }
+    }
+
+    let mut function_imports = Vec::new();
+    let mut global_imports = Vec::new();
+    let mut memory_imports = Vec::new();
+    let mut table_imports = Vec::new();
+    if let Some(reader) =
+        standard_section_reader(data, standard_section_index, sections, section_id::IMPORT)
+    {
+        for import in ImportSectionReader::new(reader)?.into_imports() {
+            let import = import?;
+            match import.ty {
+                TypeRef::Func(type_index) | TypeRef::FuncExact(type_index) => {
+                    function_imports.push(WasmFunctionImport {
+                        module: import.module,
+                        name: import.name,
+                        type_index,
+                    });
+                }
+                TypeRef::Global(ty) => {
+                    global_imports.push(WasmGlobalImport {
+                        module: import.module,
+                        name: import.name,
+                        ty,
+                    });
+                }
+                TypeRef::Table(ty) => {
+                    table_imports.push(ty);
+                }
+                TypeRef::Memory(memory) => {
+                    memory_imports.push(memory);
+                }
+                TypeRef::Tag(_) => bail!("Wasm tag imports are not emitted"),
+            }
+        }
+    }
+
+    let mut module_functions = Vec::new();
+    if let Some(reader) =
+        standard_section_reader(data, standard_section_index, sections, section_id::FUNCTION)
+    {
+        for ty in FunctionSectionReader::new(reader)? {
+            module_functions.push(ty?);
+        }
+    }
+
+    let mut module_globals = Vec::new();
+    if let Some(reader) =
+        standard_section_reader(data, standard_section_index, sections, section_id::GLOBAL)
+    {
+        for global in GlobalSectionReader::new(reader)? {
+            let global = global?;
+            let init_expr_body = const_expr_body(&global.init_expr)
+                .ok_or_else(|| crate::error!("Wasm global initializer is missing end opcode"))?;
+            module_globals.push(OutputGlobal {
+                ty: global.ty,
+                init_expr_body: Cow::Borrowed(init_expr_body),
+            });
+        }
+    }
+
+    let mut memories = Vec::new();
+    if let Some(reader) =
+        standard_section_reader(data, standard_section_index, sections, section_id::MEMORY)
+    {
+        for memory in MemorySectionReader::new(reader)? {
+            memories.push(memory?);
+        }
+    }
+
+    let mut exports = Vec::new();
+    if let Some(reader) =
+        standard_section_reader(data, standard_section_index, sections, section_id::EXPORT)
+    {
+        for export in ExportSectionReader::new(reader)? {
+            let export = export?;
+            exports.push(OutputExport {
+                name: export.name,
+                kind: export.kind,
+                index: export.index,
+            });
+        }
+    }
+
+    let mut function_bodies = Vec::new();
+    if let Some(reader) =
+        standard_section_reader(data, standard_section_index, sections, section_id::CODE)
+    {
+        let code_payload_start = standard_section_index[section_id::CODE as usize]
+            .and_then(|i| sections.get(i as usize))
+            .map_or(0, |h| h.payload_range.start);
+        for body in CodeSectionReader::new(reader)? {
+            let body = body?;
+            let range = body.range();
+            let code_offset = u32::try_from(range.start)
+                .ok()
+                .and_then(|start| start.checked_sub(code_payload_start))
+                .ok_or_else(|| crate::error!("Wasm function body offset overflow"))?;
+            function_bodies.push(WasmFunctionBody {
+                bytes: &data[range],
+                code_offset,
+            });
+        }
+    }
+
+    let mut data_segments = Vec::new();
+    if let Some(reader) =
+        standard_section_reader(data, standard_section_index, sections, section_id::DATA)
+    {
+        let reader = DataSectionReader::new(reader)?;
+        let mut section_offset = u32::try_from(uleb128_size(u64::from(reader.count())))
+            .context("Wasm data count LEB")?;
+        for segment in reader {
+            let segment = segment?;
+            let encoded_size = wasm_data_segment_encoded_size(&segment.kind, segment.data.len())?;
+            data_segments.push(WasmDataSegment {
+                kind: segment.kind.clone(),
+                data: segment.data,
+                section_offset,
+                encoded_size,
+            });
+            section_offset = section_offset
+                .checked_add(encoded_size)
+                .ok_or_else(|| crate::error!("Wasm data section offset overflow"))?;
+        }
+    }
+
+    ensure!(
+        module_functions.len() == function_bodies.len(),
+        "Wasm function and code section counts differ"
+    );
+
+    let function_body_spans = function_bodies
+        .iter()
+        .map(|body| (body.code_offset, body.code_offset + body.bytes.len() as u32))
+        .collect();
+    let data_segment_spans = data_segments
+        .iter()
+        .map(|segment| {
+            (
+                segment.section_offset,
+                segment.section_offset + segment.encoded_size,
+            )
+        })
+        .collect();
+
+    Ok(ParsedStandardSections {
+        types,
+        function_imports,
+        global_imports,
+        memory_imports,
+        table_imports,
+        module_functions,
+        module_globals,
+        memories,
+        exports,
+        function_bodies,
+        data_segments,
+        function_body_spans,
+        data_segment_spans,
+    })
 }
 
 fn mark_all_wasm_units_live_and_scan_relocs<'data, 'scope, A: platform::Arch<Platform = Wasm>>(
@@ -7091,31 +7040,28 @@ fn enqueue_wasm_gc_roots<'data, 'scope, A: platform::Arch<Platform = Wasm>>(
     let num_function_imports = file.num_function_imports;
     let num_global_imports = file.num_global_imports;
 
-    if let Some(export_section) = file.export_section_reader()? {
-        for export in export_section {
-            let export = export?;
-            let unit = match export.kind {
-                wasmparser::ExternalKind::Func | wasmparser::ExternalKind::FuncExact => {
-                    if export.index < num_function_imports {
-                        Some(WasmGcUnit::FunctionImport(export.index))
-                    } else {
-                        Some(WasmGcUnit::DefinedFunction(
-                            export.index - num_function_imports,
-                        ))
-                    }
+    for export in &file.exports {
+        let unit = match export.kind {
+            wasmparser::ExternalKind::Func | wasmparser::ExternalKind::FuncExact => {
+                if export.index < num_function_imports {
+                    Some(WasmGcUnit::FunctionImport(export.index))
+                } else {
+                    Some(WasmGcUnit::DefinedFunction(
+                        export.index - num_function_imports,
+                    ))
                 }
-                wasmparser::ExternalKind::Global => {
-                    if export.index < num_global_imports {
-                        Some(WasmGcUnit::GlobalImport(export.index))
-                    } else {
-                        Some(WasmGcUnit::DefinedGlobal(export.index - num_global_imports))
-                    }
-                }
-                _ => None,
-            };
-            if let Some(unit) = unit {
-                enqueue_wasm_gc_unit::<A>(object, unit, resources, queue, scope);
             }
+            wasmparser::ExternalKind::Global => {
+                if export.index < num_global_imports {
+                    Some(WasmGcUnit::GlobalImport(export.index))
+                } else {
+                    Some(WasmGcUnit::DefinedGlobal(export.index - num_global_imports))
+                }
+            }
+            _ => None,
+        };
+        if let Some(unit) = unit {
+            enqueue_wasm_gc_unit::<A>(object, unit, resources, queue, scope);
         }
     }
 
@@ -7190,10 +7136,7 @@ fn walk_wasm_gc_unit_edges<'data, 'scope, A: platform::Arch<Platform = Wasm>>(
 ) -> Result {
     match unit {
         WasmGcUnit::DefinedFunction(ordinal) => {
-            let Some(&(start, end)) = object
-                .format_specific
-                .function_body_spans
-                .get(ordinal as usize)
+            let Some(&(start, end)) = object.object.function_body_spans.get(ordinal as usize)
             else {
                 bail!("Wasm GC function ordinal {ordinal} out of range");
             };
@@ -7204,11 +7147,7 @@ fn walk_wasm_gc_unit_edges<'data, 'scope, A: platform::Arch<Platform = Wasm>>(
             }
         }
         WasmGcUnit::DataSegment(ordinal) => {
-            let Some(&(start, end)) = object
-                .format_specific
-                .data_segment_spans
-                .get(ordinal as usize)
-            else {
+            let Some(&(start, end)) = object.object.data_segment_spans.get(ordinal as usize) else {
                 bail!("Wasm GC data segment ordinal {ordinal} out of range");
             };
             let range = reloc_index_range(&object.format_specific.data_relocations, start, end);
@@ -7313,67 +7252,41 @@ fn send_wasm_definition_request<'data, 'scope, A: platform::Arch<Platform = Wasm
 /// omit their name; the canonical name is carried by the import entry instead.
 fn backfill_unnamed_import_symbols(
     data: &[u8],
-    standard_section_index: &[Option<u32>; STANDARD_SECTION_LOOKUP_LEN],
-    sections: &[SectionHeader],
+    function_imports: &[WasmFunctionImport<'_>],
+    global_imports: &[WasmGlobalImport<'_>],
     symbols: &mut [WasmSymbol],
-) -> Result {
-    // Collect import names only if there are unnamed undefined symbols that need backfilling.
+) {
     let needs_backfill = symbols.iter().any(|s| {
         s.is_undefined()
             && !s.has_name()
             && matches!(s.kind, WasmSymbolKind::Func | WasmSymbolKind::Global)
     });
     if !needs_backfill {
-        return Ok(());
+        return;
     }
 
     let data_start = data.as_ptr() as usize;
-
-    // Parse the import section to build name lookup tables indexed by function/global import
-    // ordinal.
-    let Some(import_payload) = standard_section_index
-        .get(section_id::IMPORT as usize)
-        .and_then(|idx| idx.as_ref())
-        .and_then(|&idx| sections.get(idx as usize))
-        .and_then(|header| data.get(header.payload_range_usize()))
-    else {
-        return Ok(());
+    let name_range = |name: &str| -> (u32, u32) {
+        let start = name.as_ptr() as usize - data_start;
+        (start as u32, name.len() as u32)
     };
-    let import_reader = ImportSectionReader::new(BinaryReader::new(import_payload, 0))?;
-
-    let mut func_import_names: Vec<(u32, u32)> = Vec::new();
-    let mut global_import_names: Vec<(u32, u32)> = Vec::new();
-    for import in import_reader.into_imports() {
-        let import = import?;
-        let name_ptr = import.name.as_ptr() as usize - data_start;
-        let name_entry = (name_ptr as u32, import.name.len() as u32);
-        match import.ty {
-            TypeRef::Func(_) | TypeRef::FuncExact(_) => func_import_names.push(name_entry),
-            TypeRef::Global(_) => global_import_names.push(name_entry),
-            _ => {}
-        }
-    }
 
     for sym in symbols.iter_mut() {
         if !sym.is_undefined() || sym.has_name() {
             continue;
         }
         let (start, len) = match sym.kind {
-            WasmSymbolKind::Func => func_import_names
+            WasmSymbolKind::Func => function_imports
                 .get(sym.index as usize)
-                .copied()
-                .unwrap_or((0, 0)),
-            WasmSymbolKind::Global => global_import_names
+                .map_or((0, 0), |import| name_range(import.name)),
+            WasmSymbolKind::Global => global_imports
                 .get(sym.index as usize)
-                .copied()
-                .unwrap_or((0, 0)),
+                .map_or((0, 0), |import| name_range(import.name)),
             _ => continue,
         };
         sym.name_start = start;
         sym.name_len = len;
     }
-
-    Ok(())
 }
 
 fn parse_linking_subsections<'data>(
