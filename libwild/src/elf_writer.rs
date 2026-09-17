@@ -2760,21 +2760,36 @@ pub(crate) fn apply_debug_relocations<
         relocation_count += 1;
         let rel = rel?;
         let offset_in_section = rel.offset();
-        apply_debug_relocation::<C, A, R>(
+        if !try_apply_thin_debug_reloc::<C, A, R>(
             object,
             offset_in_section,
             &rel,
             layout,
             tombstone_value,
             out,
-            &relocation_cache,
         )
         .with_context(|| {
             format!(
                 "Failed to apply {} at offset 0x{offset_in_section:x}",
                 display_relocation::<C, A, R>(object, &rel, layout)
             )
-        })?;
+        })? {
+            apply_debug_relocation::<C, A, R>(
+                object,
+                offset_in_section,
+                &rel,
+                layout,
+                tombstone_value,
+                out,
+                &relocation_cache,
+            )
+            .with_context(|| {
+                format!(
+                    "Failed to apply {} at offset 0x{offset_in_section:x}",
+                    display_relocation::<C, A, R>(object, &rel, layout)
+                )
+            })?;
+        }
         relocation_cache.previous = Some(rel);
     }
     layout
@@ -3829,6 +3844,114 @@ fn maybe_get_thunk_for_relocation<C: ElfClass, A: Arch<Platform = elf::Elf<C>>>(
         part = layout.output_sections.part_debug(section_info.part_id),
         offset = value as i64,
     );
+}
+
+#[inline(always)]
+fn try_apply_thin_debug_reloc<'data, C, A, R>(
+    object_layout: &ObjectLayout<'data, elf::Elf<C>>,
+    offset_in_section: u64,
+    rel: &R,
+    layout: &ElfLayout<C>,
+    section_tombstone_value: u64,
+    out: &mut [u8],
+) -> Result<bool>
+where
+    C: ElfClass,
+    A: Arch<Platform = elf::Elf<C>>,
+    R: Relocation<Platform = elf::Elf<C>>,
+{
+    let Some(symbol_index) = rel.symbol() else {
+        return Ok(false);
+    };
+    let addend = rel.addend();
+    let r_type = rel.raw_type();
+    let Some(dest) = out.get_mut(offset_in_section as usize..) else {
+        return Ok(false);
+    };
+
+    let local_symbol_id = object_layout.symbol_id_range.input_to_id(symbol_index);
+    let canonical_id = layout.symbol_db.definition(local_symbol_id);
+    let value = if let Some(resolution) = layout.local_symbol_resolution(canonical_id) {
+        if resolution.flags.is_ifunc() {
+            return Ok(false);
+        }
+        if resolution.raw_value != 0 {
+            resolution.raw_value.wrapping_add(addend as u64)
+        } else if let Some(merged) = get_merged_string_output_address::<elf::Elf<C>>(
+            symbol_index,
+            addend,
+            object_layout.object,
+            &object_layout.sections,
+            &layout.symbol_db.section_part_ids,
+            object_layout.section_id_range,
+            &layout.merged_strings,
+            &layout.merged_string_start_addresses,
+            false,
+        )? {
+            merged
+        } else {
+            addend as u64
+        }
+    } else {
+        let sym = object_layout.object.symbol(symbol_index)?;
+        if crate::platform::Symbol::is_ifunc(sym) || crate::platform::Symbol::is_tls(sym) {
+            return Ok(false);
+        }
+        if let Some(section_index) = object_layout.object.symbol_section(sym, symbol_index)? {
+            if let Some(section_address) =
+                object_layout.section_resolutions[section_index.0].address()
+            {
+                let st_value = crate::platform::Symbol::value(sym);
+                let output_offset = if st_value == 0 {
+                    0
+                } else {
+                    opt_input_to_output(
+                        object_layout.section_relax_deltas.get(section_index.0),
+                        st_value,
+                    )
+                };
+                section_address
+                    .wrapping_add(output_offset)
+                    .wrapping_add(addend as u64)
+            } else {
+                match object_layout.sections[section_index.0] {
+                    SectionSlot::MergeStrings(..) => {
+                        get_merged_string_output_address::<elf::Elf<C>>(
+                            symbol_index,
+                            addend,
+                            object_layout.object,
+                            &object_layout.sections,
+                            &layout.symbol_db.section_part_ids,
+                            object_layout.section_id_range,
+                            &layout.merged_strings,
+                            &layout.merged_string_start_addresses,
+                            false,
+                        )?
+                        .context("Cannot get merged string offset for a debug info section")?
+                    }
+                    SectionSlot::Discard
+                    | SectionSlot::Unloaded(_)
+                    | SectionSlot::UnloadedDebugInfo => section_tombstone_value,
+                    _ => return Ok(false),
+                }
+            }
+        } else {
+            section_tombstone_value
+        }
+    };
+
+    if A::write_simple_debug_absolute(r_type, value, dest)? {
+        return Ok(true);
+    }
+
+    let rel_info = A::relocation_from_raw(r_type)?;
+    match rel_info.kind {
+        RelocationKind::Absolute | RelocationKind::AbsoluteSet => {
+            rel_info.write_to_buffer(value, dest)?;
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
 }
 
 fn apply_debug_relocation<
