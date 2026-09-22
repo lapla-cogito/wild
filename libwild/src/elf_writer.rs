@@ -3417,6 +3417,7 @@ fn apply_relocation<
         RelocationKind::Absolute => write_absolute_relocation::<C, A>(
             table_writer,
             resolution,
+            rel_info.size,
             place,
             addend,
             section_info,
@@ -4056,6 +4057,7 @@ fn apply_debug_relocation<
 fn write_absolute_relocation<'data, C: ElfClass, A: Arch<Platform = elf::Elf<C>>>(
     table_writer: &mut TableWriter<'_, '_, C>,
     resolution: Resolution<elf::Elf<C>>,
+    rel_size: RelocationSize,
     place: u64,
     addend: i64,
     section_info: SectionInfo<<A::Platform as Platform>::SectionFlags>,
@@ -4078,7 +4080,10 @@ fn write_absolute_relocation<'data, C: ElfClass, A: Arch<Platform = elf::Elf<C>>
     {
         // Weak undefined symbol referenced from a read-only section. Fill in as zero.
         Ok(0)
-    } else if resolution.flags.is_interposable() && section_info.is_writable {
+    } else if resolution.flags.is_interposable()
+        && section_info.is_writable
+        && rel_size == RelocationSize::ByteSize(C::ADDRESS_SIZE as usize)
+    {
         table_writer.write_dynamic_symbol_relocation::<A>(
             place,
             addend,
