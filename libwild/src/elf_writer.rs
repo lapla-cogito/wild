@@ -3399,6 +3399,11 @@ fn apply_relocation<
     // `original_place` in that our `offset_in_section` may have been adjusted by a relaxation.
     let place = section_address + offset_in_section;
 
+    let undefined_weak_target = if flags.is_undefined_weak() && !flags.needs_plt() {
+        A::undefined_weak_target(r_type, place)
+    } else {
+        None
+    };
     let mask = get_page_mask(rel_info.mask);
     let bias = rel_info.bias;
     // For ppc64 calls, branch to the callee's local entry point (we share its TOC, so the global
@@ -3460,19 +3465,26 @@ fn apply_relocation<
                 &layout.merged_string_start_addresses,
             )?
             .bitand(mask.symbol_plus_addend),
-        RelocationKind::Relative => resolution
-            .value_with_addend(
-                addend,
-                symbol_index,
-                object_layout,
-                &layout.symbol_db.section_part_ids,
-                &layout.merged_strings,
-                &layout.merged_string_start_addresses,
-            )?
-            .wrapping_add(branch_local_entry)
-            .wrapping_add(bias)
-            .bitand(mask.symbol_plus_addend)
-            .wrapping_sub(place.bitand(mask.place)),
+        RelocationKind::Relative => {
+            let symbol_plus_addend = if let Some(target) = undefined_weak_target {
+                target.wrapping_add(addend as u64)
+            } else {
+                resolution.value_with_addend(
+                    addend,
+                    symbol_index,
+                    object_layout,
+                    &layout.symbol_db.section_part_ids,
+                    &layout.merged_strings,
+                    &layout.merged_string_start_addresses,
+                )?
+            };
+
+            symbol_plus_addend
+                .wrapping_add(branch_local_entry)
+                .wrapping_add(bias)
+                .bitand(mask.symbol_plus_addend)
+                .wrapping_sub(place.bitand(mask.place))
+        }
         RelocationKind::RelativeLoongArchHigh => highest_relocation_with_bias(
             resolution.value_with_addend(
                 addend,
