@@ -31,6 +31,9 @@ use hashbrown::HashSet;
 use leb128::write::signed_len as sleb128_size;
 use leb128::write::unsigned_len as uleb128_size;
 use linker_utils::utils::u32_from_slice;
+use object::Object as _;
+use object::ObjectSection as _;
+use object::ObjectSymbol as _;
 use rayon::prelude::*;
 use std::borrow::Cow;
 use std::ops::Range;
@@ -47,16 +50,11 @@ use wasmparser::FunctionSectionReader;
 use wasmparser::GlobalSectionReader;
 use wasmparser::GlobalType;
 use wasmparser::ImportSectionReader;
-use wasmparser::KnownCustom;
 use wasmparser::Linking;
 use wasmparser::MemorySectionReader;
 use wasmparser::MemoryType;
-use wasmparser::Parser;
-use wasmparser::Payload;
-use wasmparser::RelocationEntry;
 use wasmparser::RelocationType;
 use wasmparser::SymbolFlags;
-use wasmparser::SymbolInfo;
 use wasmparser::TypeRef;
 use wasmparser::TypeSectionReader;
 
@@ -151,47 +149,13 @@ pub(crate) mod output_section_id {
         SinglePartSectionId::WasmTargetFeatures.output_section_id();
 }
 
-/// Magic bytes at the start of every Wasm module.
-pub(crate) const WASM_MAGIC: [u8; 4] = [0x00, b'a', b's', b'm'];
-
-/// Supported Wasm binary format version.
-pub(crate) const WASM_VERSION: u32 = 1;
-
-pub(crate) mod section_id {
-    pub(crate) const TYPE: u8 = 1;
-    pub(crate) const IMPORT: u8 = 2;
-    pub(crate) const FUNCTION: u8 = 3;
-    pub(crate) const TABLE: u8 = 4;
-    pub(crate) const MEMORY: u8 = 5;
-    pub(crate) const GLOBAL: u8 = 6;
-    pub(crate) const EXPORT: u8 = 7;
-    pub(crate) const START: u8 = 8;
-    pub(crate) const ELEMENT: u8 = 9;
-    pub(crate) const CODE: u8 = 10;
-    pub(crate) const DATA: u8 = 11;
-    pub(crate) const DATA_COUNT: u8 = 12;
-    pub(crate) const MAX: u8 = DATA_COUNT;
-}
-
-/// Size of a `[Option<u32>; _]` lookup that can be indexed by any standard section id.
-pub(crate) const STANDARD_SECTION_LOOKUP_LEN: usize = section_id::MAX as usize + 1;
+/// Size of a `[Option<u32>; _]` lookup indexed by a standard section id.
+///
+/// Tag sections are parsed, but they are not part of this lookup.
+pub(crate) const STANDARD_SECTION_LOOKUP_LEN: usize = object::wasm::SEC_DATA_COUNT.0 as usize + 1;
 
 /// Default `__table_base` for non-PIC executables.
 const DEFAULT_TABLE_BASE: u32 = 1;
-
-/// The custom-section name used for the linker metadata.
-pub(crate) const LINKING_SECTION_NAME: &str = "linking";
-
-/// The prefix of every `reloc.*` custom section.
-pub(crate) const RELOC_SECTION_PREFIX: &str = "reloc.";
-
-/// The custom-section name used for the WebAssembly target features.
-pub(crate) const TARGET_FEATURES_SECTION_NAME: &str = "target_features";
-
-/// Feature is used by this object (`+` in the target_features section).
-const TARGET_FEATURE_PREFIX_USED: u8 = b'+';
-/// Feature must not appear in the output (`-` in the target_features section).
-const TARGET_FEATURE_PREFIX_DISALLOWED: u8 = b'-';
 
 /// Default static data base for linker-produced executables.
 const LINKER_MEMORY_BASE: u32 = 1024;
@@ -303,19 +267,19 @@ impl SectionHeader {
 }
 
 fn standard_section_name(id: u8) -> Option<&'static [u8]> {
-    Some(match id {
-        section_id::TYPE => b"type",
-        section_id::IMPORT => b"import",
-        section_id::FUNCTION => b"function",
-        section_id::TABLE => b"table",
-        section_id::MEMORY => b"memory",
-        section_id::GLOBAL => b"global",
-        section_id::EXPORT => b"export",
-        section_id::START => b"start",
-        section_id::ELEMENT => b"element",
-        section_id::CODE => b"code",
-        section_id::DATA => b"data",
-        section_id::DATA_COUNT => b"data_count",
+    Some(match object::wasm::SectionId(id) {
+        object::wasm::SEC_TYPE => b"type",
+        object::wasm::SEC_IMPORT => b"import",
+        object::wasm::SEC_FUNCTION => b"function",
+        object::wasm::SEC_TABLE => b"table",
+        object::wasm::SEC_MEMORY => b"memory",
+        object::wasm::SEC_GLOBAL => b"global",
+        object::wasm::SEC_EXPORT => b"export",
+        object::wasm::SEC_START => b"start",
+        object::wasm::SEC_ELEMENT => b"element",
+        object::wasm::SEC_CODE => b"code",
+        object::wasm::SEC_DATA => b"data",
+        object::wasm::SEC_DATA_COUNT => b"data_count",
         _ => return None,
     })
 }
@@ -381,29 +345,17 @@ impl WasmSymbol {
     }
 }
 
-/// A `reloc.*` custom section header.
+/// A `reloc.*` custom section.
 #[derive(Debug, Clone)]
 pub(crate) struct WasmRelocSection {
     /// Index (into [`File::sections`]) of the section that the relocations apply to.
     pub(crate) target_section_index: u32,
-    /// Byte range of the section's contents (after the section name) within the module bytes.
-    pub(crate) payload_range: Range<u32>,
+    entries: Vec<WasmRelocation>,
 }
 
 impl WasmRelocSection {
-    pub(crate) fn decode_entries(&self, data: &[u8]) -> Result<Vec<WasmRelocation>> {
-        let payload = data
-            .get(self.payload_range.start as usize..self.payload_range.end as usize)
-            .ok_or_else(|| crate::error!("Wasm reloc section payload range out of bounds"))?;
-        let reader = wasmparser::RelocSectionReader::new(BinaryReader::new(
-            payload,
-            u64::from(self.payload_range.start),
-        ))?;
-        reader
-            .entries()
-            .into_iter()
-            .map(|entry| Ok(WasmRelocation::from_entry(entry?)))
-            .collect()
+    pub(crate) fn decode_entries(&self, _data: &[u8]) -> Result<Vec<WasmRelocation>> {
+        Ok(self.entries.clone())
     }
 }
 
@@ -459,35 +411,14 @@ define_relocation_type_to_string!(
 );
 
 impl WasmRelocation {
-    fn from_entry(entry: RelocationEntry) -> Self {
-        Self {
-            ty: entry.ty,
-            offset: entry.offset,
-            index: entry.index,
-            addend: entry.addend,
-        }
-    }
-
     /// Width in bytes of the slot this relocation overwrites.
     pub(crate) fn slot_size(&self) -> usize {
-        match self.ty {
-            RelocationType::FunctionIndexLeb
-            | RelocationType::TableIndexSleb
-            | RelocationType::TableIndexRelSleb
-            | RelocationType::MemoryAddrLeb
-            | RelocationType::MemoryAddrSleb
-            | RelocationType::MemoryAddrRelSleb
-            | RelocationType::MemoryAddrTlsSleb
-            | RelocationType::TypeIndexLeb
-            | RelocationType::GlobalIndexLeb
-            | RelocationType::EventIndexLeb
-            | RelocationType::TableNumberLeb => 5,
-            RelocationType::TableIndexI32
-            | RelocationType::MemoryAddrI32
-            | RelocationType::FunctionOffsetI32
-            | RelocationType::SectionOffsetI32
-            | RelocationType::GlobalIndexI32
-            | RelocationType::FunctionIndexI32 => 4,
+        // `R_WASM_MEMORY_ADDR_LOCREL_I32` is 4 bytes, but this linker does not apply it.
+        if self.ty == RelocationType::MemoryAddrLocrelI32 {
+            return 0;
+        }
+        match object::wasm::RelocationType(self.ty as u8).extent() {
+            Some(size @ (4 | 5)) => usize::from(size),
             _ => 0,
         }
     }
@@ -672,49 +603,49 @@ impl<'data> File<'data> {
     }
 
     pub(crate) fn import_section_reader(&self) -> Result<Option<ImportSectionReader<'data>>> {
-        self.standard_section_reader(section_id::IMPORT)
+        self.standard_section_reader(object::wasm::SEC_IMPORT.0)
             .map(|r| ImportSectionReader::new(r).map_err(Into::into))
             .transpose()
     }
 
     pub(crate) fn function_section_reader(&self) -> Result<Option<FunctionSectionReader<'data>>> {
-        self.standard_section_reader(section_id::FUNCTION)
+        self.standard_section_reader(object::wasm::SEC_FUNCTION.0)
             .map(|r| FunctionSectionReader::new(r).map_err(Into::into))
             .transpose()
     }
 
     pub(crate) fn global_section_reader(&self) -> Result<Option<GlobalSectionReader<'data>>> {
-        self.standard_section_reader(section_id::GLOBAL)
+        self.standard_section_reader(object::wasm::SEC_GLOBAL.0)
             .map(|r| GlobalSectionReader::new(r).map_err(Into::into))
             .transpose()
     }
 
     pub(crate) fn data_section_reader(&self) -> Result<Option<DataSectionReader<'data>>> {
-        self.standard_section_reader(section_id::DATA)
+        self.standard_section_reader(object::wasm::SEC_DATA.0)
             .map(|r| DataSectionReader::new(r).map_err(Into::into))
             .transpose()
     }
 
     pub(crate) fn code_section_reader(&self) -> Result<Option<CodeSectionReader<'data>>> {
-        self.standard_section_reader(section_id::CODE)
+        self.standard_section_reader(object::wasm::SEC_CODE.0)
             .map(|r| CodeSectionReader::new(r).map_err(Into::into))
             .transpose()
     }
 
     pub(crate) fn memory_section_reader(&self) -> Result<Option<MemorySectionReader<'data>>> {
-        self.standard_section_reader(section_id::MEMORY)
+        self.standard_section_reader(object::wasm::SEC_MEMORY.0)
             .map(|r| MemorySectionReader::new(r).map_err(Into::into))
             .transpose()
     }
 
     pub(crate) fn export_section_reader(&self) -> Result<Option<ExportSectionReader<'data>>> {
-        self.standard_section_reader(section_id::EXPORT)
+        self.standard_section_reader(object::wasm::SEC_EXPORT.0)
             .map(|r| ExportSectionReader::new(r).map_err(Into::into))
             .transpose()
     }
 
     pub(crate) fn type_section_reader(&self) -> Result<Option<TypeSectionReader<'data>>> {
-        self.standard_section_reader(section_id::TYPE)
+        self.standard_section_reader(object::wasm::SEC_TYPE.0)
             .map(|r| TypeSectionReader::new(r).map_err(Into::into))
             .transpose()
     }
@@ -765,7 +696,7 @@ impl<'data> File<'data> {
         let Some(reader) = self.code_section_reader()? else {
             return Ok(Vec::new());
         };
-        let code_payload_start = self.standard_section_index[section_id::CODE as usize]
+        let code_payload_start = self.standard_section_index[object::wasm::SEC_CODE.0 as usize]
             .and_then(|i| self.sections.get(i as usize))
             .map_or(0, |h| h.payload_range.start);
         reader
@@ -1889,10 +1820,10 @@ fn collect_target_feature_sets<'data>(
     for input in layout_inputs {
         for feature in input.target_features {
             match feature.prefix {
-                TARGET_FEATURE_PREFIX_USED => {
+                object::wasm::FEATURE_PREFIX_USED => {
                     used.insert(feature.name);
                 }
-                TARGET_FEATURE_PREFIX_DISALLOWED => {
+                object::wasm::FEATURE_PREFIX_DISALLOWED => {
                     disallowed.entry(feature.name).or_insert(input.file_id);
                 }
                 other => {
@@ -1959,14 +1890,14 @@ fn build_target_features_section<'data>(
     let mut payload = Vec::new();
     leb128::write::unsigned(&mut payload, names.len() as u64).unwrap();
     for name in names {
-        payload.push(TARGET_FEATURE_PREFIX_USED);
+        payload.push(object::wasm::FEATURE_PREFIX_USED);
         let name_bytes = name.as_bytes();
         leb128::write::unsigned(&mut payload, name_bytes.len() as u64).unwrap();
         payload.extend_from_slice(name_bytes);
     }
 
     Ok(Some(wasm_encoder::CustomSection {
-        name: Cow::Borrowed(TARGET_FEATURES_SECTION_NAME),
+        name: Cow::Borrowed(object::wasm::TARGET_FEATURES_SECTION_NAME),
         data: Cow::Owned(payload),
     }))
 }
@@ -2711,10 +2642,14 @@ impl<'data> WasmObjectLayout<'data> {
             return Ok(());
         }
 
-        let code_relocations =
-            decode_sorted_relocs_for(file, file.standard_section_index[section_id::CODE as usize])?;
-        let data_relocations =
-            decode_sorted_relocs_for(file, file.standard_section_index[section_id::DATA as usize])?;
+        let code_relocations = decode_sorted_relocs_for(
+            file,
+            file.standard_section_index[object::wasm::SEC_CODE.0 as usize],
+        )?;
+        let data_relocations = decode_sorted_relocs_for(
+            file,
+            file.standard_section_index[object::wasm::SEC_DATA.0 as usize],
+        )?;
 
         let function_bodies = file.function_bodies()?;
         let function_body_spans = function_body_spans_from_bodies(&function_bodies)?;
@@ -3039,8 +2974,8 @@ impl<'data> WasmObjectLayoutInput<'data> {
             layout.live_global_import_bits()
         };
 
-        let code_section_index = file.standard_section_index[section_id::CODE as usize];
-        let data_section_index = file.standard_section_index[section_id::DATA as usize];
+        let code_section_index = file.standard_section_index[object::wasm::SEC_CODE.0 as usize];
+        let data_section_index = file.standard_section_index[object::wasm::SEC_DATA.0 as usize];
 
         let (code_relocations_all, data_relocations_all) = if decoded.ready {
             (decoded.code_relocations, decoded.data_relocations)
@@ -3069,10 +3004,10 @@ impl<'data> WasmObjectLayoutInput<'data> {
         {
             unsupported_output.push("data relocation");
         }
-        if file.standard_section_index[section_id::TABLE as usize].is_some() {
+        if file.standard_section_index[object::wasm::SEC_TABLE.0 as usize].is_some() {
             unsupported_output.push("table definition");
         }
-        if file.standard_section_index[section_id::START as usize].is_some() {
+        if file.standard_section_index[object::wasm::SEC_START.0 as usize].is_some() {
             unsupported_output.push("start");
         }
         let all_data_segments = if decoded.ready {
@@ -7191,7 +7126,10 @@ impl platform::Platform for Wasm {
         _resources: &layout::FinaliseSizesResources<'data, '_, Self>,
         _args: &Self::Args,
     ) {
-        sizes.increment(crate::part_id::FILE_HEADER, (WASM_MAGIC.len() + 4) as u64);
+        sizes.increment(
+            crate::part_id::FILE_HEADER,
+            (object::wasm::MAGIC.len() + 4) as u64,
+        );
     }
 
     fn finalise_sizes_for_symbol<'data>(
@@ -7344,66 +7282,147 @@ impl platform::Platform for Wasm {
     }
 }
 
+fn name_in_input(input: &[u8], name: &str) -> Option<u32> {
+    if name.is_empty() {
+        return None;
+    }
+    let base = input.as_ptr() as usize;
+    let start = name.as_ptr() as usize;
+    let end = start.checked_add(name.len())?;
+    if start < base || end > base + input.len() {
+        return None;
+    }
+    u32::try_from(start - base).ok()
+}
+
+/// Section id, content range, and custom-section name range.
+///
+/// `WasmSection::file_range` for a custom section is the payload after the name. The content
+/// range used by the rest of the linker includes the name's length prefix.
+fn section_bytes<'data, 'file>(
+    input: &'data [u8],
+    section: &object::read::wasm::WasmSection<'data, 'file>,
+) -> Result<(u8, Range<u32>, Option<Range<u32>>)> {
+    let id = section
+        .wasm_id()
+        .ok_or_else(|| crate::error!("Wasm section has no id"))?
+        .0;
+    let (data_start, len) = section
+        .file_range()
+        .ok_or_else(|| crate::error!("Wasm section has no file range"))?;
+    let data_end = data_start
+        .checked_add(len)
+        .ok_or_else(|| crate::error!("Wasm section range overflow"))?;
+    if id != object::wasm::SEC_CUSTOM.0 {
+        let start = u32::try_from(data_start)
+            .map_err(|_| crate::error!("Wasm section offset exceeds u32"))?;
+        let end =
+            u32::try_from(data_end).map_err(|_| crate::error!("Wasm section end exceeds u32"))?;
+        return Ok((id, start..end, None));
+    }
+
+    let name = section
+        .name()
+        .map_err(|err| crate::error!("invalid Wasm section name: {err}"))?;
+    let (name_range, content_start) = if let Some(name_start) = name_in_input(input, name) {
+        let leb_len = u64::try_from(uleb128_size(name.len() as u64))
+            .map_err(|_| crate::error!("Wasm custom section name is not inside the module"))?;
+        let content_start = u64::from(name_start)
+            .checked_sub(leb_len)
+            .ok_or_else(|| crate::error!("Wasm custom section name is not inside the module"))?;
+        let name_end = name_start
+            .checked_add(name.len() as u32)
+            .ok_or_else(|| crate::error!("Wasm section name offset exceeds u32"))?;
+        (name_start..name_end, content_start)
+    } else if name.is_empty() {
+        let content_start = data_start
+            .checked_sub(1)
+            .ok_or_else(|| crate::error!("Wasm custom section name is not inside the module"))?;
+        let at = u32::try_from(data_start)
+            .map_err(|_| crate::error!("Wasm section offset exceeds u32"))?;
+        (at..at, content_start)
+    } else {
+        bail!("Wasm custom section name is not inside the module");
+    };
+    let start = u32::try_from(content_start)
+        .map_err(|_| crate::error!("Wasm section offset exceeds u32"))?;
+    let end = u32::try_from(data_end).map_err(|_| crate::error!("Wasm section end exceeds u32"))?;
+    Ok((id, start..end, Some(name_range)))
+}
+
 fn parse_wasm_module<'data>(input: &'data [u8]) -> Result<File<'data>> {
     ensure!(input.len() >= 8, "Wasm module too short");
-    ensure!(input[..4] == WASM_MAGIC, "missing Wasm magic header");
+    ensure!(
+        input[..4] == object::wasm::MAGIC,
+        "missing Wasm magic header"
+    );
     let version = u32_from_slice(&input[4..8]);
     ensure!(
-        version == WASM_VERSION,
+        version == object::wasm::VERSION,
         "unsupported Wasm version {version}"
     );
 
+    let parsed = object::read::wasm::WasmFile::parse(input)
+        .map_err(|err| crate::error!("invalid Wasm module: {err}"))?;
+
     let mut sections: Vec<SectionHeader> = Vec::new();
-    let mut symbols: Vec<WasmSymbol> = Vec::new();
-    let mut segment_infos: Vec<WasmSegmentInfo<'data>> = Vec::new();
     let mut init_funcs: Vec<WasmInitFunc> = Vec::new();
-    let mut reloc_sections: Vec<WasmRelocSection> = Vec::new();
     let mut target_features: Vec<WasmTargetFeature<'data>> = Vec::new();
     let mut standard_section_index = [None; STANDARD_SECTION_LOOKUP_LEN];
 
-    for payload in Parser::new(0).parse_all(input) {
-        let payload = payload?;
-        let Some((id, range)) = payload.as_section() else {
-            continue;
-        };
-
-        let mut name_range: Option<Range<u32>> = None;
-
-        if let Payload::CustomSection(reader) = &payload {
-            let section_name = reader.name();
-            let name_end = reader.data_offset();
-            let name_start = name_end as usize - section_name.len();
-            name_range = Some(name_start as u32..name_end as u32);
-
-            if section_name == LINKING_SECTION_NAME {
-                if let KnownCustom::Linking(linking) = reader.as_known() {
-                    parse_linking_subsections(
-                        input,
-                        &linking,
-                        &mut symbols,
-                        &mut segment_infos,
-                        &mut init_funcs,
-                    )?;
-                }
-            } else if section_name.starts_with(RELOC_SECTION_PREFIX) {
-                if let KnownCustom::Reloc(reloc) = reader.as_known() {
-                    reloc_sections.push(WasmRelocSection {
-                        target_section_index: reloc.section_index(),
-                        payload_range: name_end as u32..range.end as u32,
-                    });
-                }
-            } else if section_name == TARGET_FEATURES_SECTION_NAME {
-                target_features.extend(parse_target_features_payload(reader.data())?);
+    for section in parsed.wasm_sections() {
+        let (id, payload_range, name_range) = section_bytes(input, &section)?;
+        if id == object::wasm::SEC_CUSTOM.0 {
+            let name = section
+                .name()
+                .map_err(|err| crate::error!("invalid Wasm section name: {err}"))?;
+            let data = section
+                .data()
+                .map_err(|err| crate::error!("invalid Wasm custom section: {err}"))?;
+            if name == object::wasm::LINKING_SECTION_NAME {
+                init_funcs = parse_init_funcs(data)?;
+            } else if name == object::wasm::TARGET_FEATURES_SECTION_NAME {
+                target_features.extend(parse_target_features_payload(data)?);
             }
-        } else if (section_id::TYPE..=section_id::MAX).contains(&id) {
+        } else if (object::wasm::SEC_TYPE.0..=object::wasm::SEC_DATA_COUNT.0).contains(&id) {
             standard_section_index[id as usize] = Some(sections.len() as u32);
         }
-
         sections.push(SectionHeader {
             id,
-            payload_range: range.start as u32..range.end as u32,
+            payload_range,
             name_range,
         });
+    }
+
+    let mut reloc_sections = Vec::new();
+    for reloc_section in parsed.wasm_reloc_sections() {
+        let mut entries = Vec::new();
+        for reloc in reloc_section.relocations() {
+            entries.push(relocation_from_object(reloc)?);
+        }
+        reloc_sections.push(WasmRelocSection {
+            target_section_index: reloc_section.target().0,
+            entries,
+        });
+    }
+
+    let mut segment_infos = Vec::new();
+    let mut segment_addresses = Vec::new();
+    for section in parsed.sections() {
+        if section.wasm_index().is_some() {
+            continue;
+        }
+        segment_addresses.push(section.address());
+        if let Some(info) = segment_info_from_section(&section)? {
+            segment_infos.push(info);
+        }
+    }
+
+    let mut symbols = Vec::new();
+    for symbol in parsed.symbols() {
+        if let Some(symbol) = wasm_symbol_from_object(input, &symbol, &segment_addresses)? {
+            symbols.push(symbol);
+        }
     }
 
     // Backfill names for unnamed undefined function/global symbols from the import section.
@@ -7417,16 +7436,20 @@ fn parse_wasm_module<'data>(input: &'data [u8]) -> Result<File<'data>> {
         input,
         &standard_section_index,
         &sections,
-        section_id::FUNCTION,
+        object::wasm::SEC_FUNCTION.0,
     )?;
     let num_defined_globals = section_entry_count(
         input,
         &standard_section_index,
         &sections,
-        section_id::GLOBAL,
+        object::wasm::SEC_GLOBAL.0,
     )?;
-    let num_data_segments =
-        section_entry_count(input, &standard_section_index, &sections, section_id::DATA)?;
+    let num_data_segments = section_entry_count(
+        input,
+        &standard_section_index,
+        &sections,
+        object::wasm::SEC_DATA.0,
+    )?;
 
     Ok(File {
         data: input,
@@ -7445,12 +7468,108 @@ fn parse_wasm_module<'data>(input: &'data [u8]) -> Result<File<'data>> {
     })
 }
 
+fn relocation_from_object(reloc: object::read::wasm::WasmReloc) -> Result<WasmRelocation> {
+    let ty = RelocationType::try_from(reloc.ty().0)
+        .map_err(|_| crate::error!("unsupported Wasm relocation type {}", reloc.ty().0))?;
+    Ok(WasmRelocation {
+        ty,
+        offset: reloc.offset(),
+        index: reloc.index(),
+        addend: reloc.addend(),
+    })
+}
+
+fn segment_info_from_section<'data, 'file>(
+    section: &object::read::wasm::WasmSection<'data, 'file>,
+) -> Result<Option<WasmSegmentInfo<'data>>> {
+    let object::SectionFlags::Wasm { flags } = section.flags() else {
+        return Ok(None);
+    };
+    let name = section
+        .name()
+        .map_err(|err| crate::error!("invalid Wasm data segment name: {err}"))?;
+    Ok(Some(WasmSegmentInfo {
+        name,
+        alignment: Alignment::from_exponent(section.align().trailing_zeros())?,
+        flags: wasmparser::SegmentFlags::from_bits_retain(flags.0),
+    }))
+}
+
+fn wasm_symbol_from_object(
+    input: &[u8],
+    symbol: &object::read::wasm::WasmSymbol<'_, '_>,
+    segment_addresses: &[u64],
+) -> Result<Option<WasmSymbol>> {
+    let object::SymbolFlags::Wasm { flags, kind, index } = symbol.flags() else {
+        return Ok(None);
+    };
+    let mut out = WasmSymbol {
+        kind: match kind {
+            object::wasm::SYM_TYPE_FUNCTION => WasmSymbolKind::Func,
+            object::wasm::SYM_TYPE_DATA => WasmSymbolKind::Data,
+            object::wasm::SYM_TYPE_GLOBAL => WasmSymbolKind::Global,
+            object::wasm::SYM_TYPE_SECTION => WasmSymbolKind::Section,
+            object::wasm::SYM_TYPE_EVENT => WasmSymbolKind::Event,
+            object::wasm::SYM_TYPE_TABLE => WasmSymbolKind::Table,
+            _ => WasmSymbolKind::Null,
+        },
+        flags: flags.0,
+        index,
+        ..WasmSymbol::default()
+    };
+    // Undefined tables and events keep an empty linking name. `WasmFile` fills those
+    // from the import section, which this linker only does for functions and globals.
+    let name_from_import = matches!(
+        kind,
+        object::wasm::SYM_TYPE_EVENT | object::wasm::SYM_TYPE_TABLE
+    ) && flags.contains(object::wasm::SYM_UNDEFINED)
+        && !flags.contains(object::wasm::SYM_EXPLICIT_NAME);
+    if !name_from_import {
+        let name = symbol
+            .name()
+            .map_err(|err| crate::error!("invalid Wasm symbol name: {err}"))?;
+        if let Some(start) = name_in_input(input, name) {
+            out.name_start = start;
+            out.name_len = name.len() as u32;
+        }
+    }
+    if kind == object::wasm::SYM_TYPE_DATA
+        && matches!(symbol.section(), object::SymbolSection::Section(_))
+    {
+        let segment_address = segment_addresses.get(index as usize).copied().unwrap_or(0);
+        let offset = symbol.address().wrapping_sub(segment_address);
+        out.offset = u32::try_from(offset)
+            .map_err(|_| crate::error!("Wasm data symbol offset exceeds u32"))?;
+        out.size = u32::try_from(symbol.size())
+            .map_err(|_| crate::error!("Wasm data symbol size exceeds u32"))?;
+    }
+    Ok(Some(out))
+}
+
+fn parse_init_funcs(data: &[u8]) -> Result<Vec<WasmInitFunc>> {
+    let linking = wasmparser::LinkingSectionReader::new(BinaryReader::new(data, 0))?;
+    let mut init_funcs = Vec::new();
+    for sub in linking.subsections() {
+        let Linking::InitFuncs(map) = sub? else {
+            continue;
+        };
+        for init in map {
+            let init = init?;
+            init_funcs.push(WasmInitFunc {
+                priority: init.priority,
+                symbol_index: init.symbol_index,
+            });
+        }
+    }
+    Ok(init_funcs)
+}
+
 fn count_function_and_global_imports(
     data: &[u8],
     standard_section_index: &[Option<u32>; STANDARD_SECTION_LOOKUP_LEN],
     sections: &[SectionHeader],
 ) -> Result<(u32, u32)> {
-    let Some(section_index) = standard_section_index[section_id::IMPORT as usize] else {
+    let Some(section_index) = standard_section_index[object::wasm::SEC_IMPORT.0 as usize] else {
         return Ok((0, 0));
     };
     let header = sections
@@ -7793,7 +7912,7 @@ fn backfill_unnamed_import_symbols(
     // Parse the import section to build name lookup tables indexed by function/global import
     // ordinal.
     let Some(import_payload) = standard_section_index
-        .get(section_id::IMPORT as usize)
+        .get(object::wasm::SEC_IMPORT.0 as usize)
         .and_then(|idx| idx.as_ref())
         .and_then(|&idx| sections.get(idx as usize))
         .and_then(|header| data.get(header.payload_range_usize()))
@@ -7835,116 +7954,6 @@ fn backfill_unnamed_import_symbols(
     }
 
     Ok(())
-}
-
-fn parse_linking_subsections<'data>(
-    data: &'data [u8],
-    linking: &wasmparser::LinkingSectionReader<'data>,
-    symbols: &mut Vec<WasmSymbol>,
-    segment_infos: &mut Vec<WasmSegmentInfo<'data>>,
-    init_funcs: &mut Vec<WasmInitFunc>,
-) -> Result {
-    let data_start = data.as_ptr() as usize;
-    let to_name_range = |s: &str| -> (u32, u32) {
-        let start = s.as_ptr() as usize - data_start;
-        (start as u32, s.len() as u32)
-    };
-    for sub in linking.subsections() {
-        let sub = sub?;
-        match sub {
-            Linking::SymbolTable(map) => {
-                for sym in map {
-                    symbols.push(wasm_symbol_from_info(sym?, to_name_range));
-                }
-            }
-            Linking::SegmentInfo(map) => {
-                for seg in map {
-                    let seg = seg?;
-                    segment_infos.push(WasmSegmentInfo {
-                        name: seg.name,
-                        alignment: Alignment::from_exponent(seg.alignment)?,
-                        flags: seg.flags,
-                    });
-                }
-            }
-            Linking::InitFuncs(map) => {
-                for init in map {
-                    let init = init?;
-                    init_funcs.push(WasmInitFunc {
-                        priority: init.priority,
-                        symbol_index: init.symbol_index,
-                    });
-                }
-            }
-            // `ComdatInfo` and `Unknown` subsections are not consumed.
-            _ => {}
-        }
-    }
-
-    Ok(())
-}
-
-fn wasm_symbol_from_info(
-    info: SymbolInfo<'_>,
-    to_name_range: impl Fn(&str) -> (u32, u32),
-) -> WasmSymbol {
-    let mut sym = WasmSymbol::default();
-    let mut set_name = |name: Option<&str>| {
-        if let Some(n) = name {
-            let (start, len) = to_name_range(n);
-            sym.name_start = start;
-            sym.name_len = len;
-        }
-    };
-    match info {
-        SymbolInfo::Func { flags, index, name } => {
-            sym.kind = WasmSymbolKind::Func;
-            sym.flags = flags.bits();
-            sym.index = index;
-            set_name(name);
-        }
-        SymbolInfo::Data {
-            flags,
-            name,
-            symbol,
-        } => {
-            sym.kind = WasmSymbolKind::Data;
-            sym.flags = flags.bits();
-            let (start, len) = to_name_range(name);
-            sym.name_start = start;
-            sym.name_len = len;
-            if let Some(def) = symbol {
-                sym.index = def.index;
-                sym.offset = def.offset;
-                sym.size = def.size;
-            }
-        }
-        SymbolInfo::Global { flags, index, name } => {
-            sym.kind = WasmSymbolKind::Global;
-            sym.flags = flags.bits();
-            sym.index = index;
-            set_name(name);
-        }
-        SymbolInfo::Section { flags, section } => {
-            sym.kind = WasmSymbolKind::Section;
-            sym.flags = flags.bits();
-            sym.index = section;
-        }
-        SymbolInfo::Event { flags, index, name } => {
-            sym.kind = WasmSymbolKind::Event;
-            sym.flags = flags.bits();
-            sym.index = index;
-            set_name(name);
-        }
-        SymbolInfo::Table { flags, index, name } => {
-            sym.kind = WasmSymbolKind::Table;
-            sym.flags = flags.bits();
-            sym.index = index;
-            set_name(name);
-        }
-    }
-
-    sym
 }
 
 impl SinglePartSectionId {
@@ -8001,7 +8010,7 @@ mod tests {
         assert!(
             parsed
                 .iter()
-                .all(|f| f.prefix == TARGET_FEATURE_PREFIX_USED),
+                .all(|f| f.prefix == object::wasm::FEATURE_PREFIX_USED),
             "output must only contain used (+) prefixes"
         );
         parsed.iter().map(|f| f.name.to_owned()).collect()
@@ -8012,20 +8021,20 @@ mod tests {
         // Both objects use sign-ext. Only the first also uses bulk-memory.
         let features_a = [
             WasmTargetFeature {
-                prefix: TARGET_FEATURE_PREFIX_USED,
+                prefix: object::wasm::FEATURE_PREFIX_USED,
                 name: "sign-ext",
             },
             WasmTargetFeature {
-                prefix: TARGET_FEATURE_PREFIX_USED,
+                prefix: object::wasm::FEATURE_PREFIX_USED,
                 name: "bulk-memory",
             },
             WasmTargetFeature {
-                prefix: TARGET_FEATURE_PREFIX_USED,
+                prefix: object::wasm::FEATURE_PREFIX_USED,
                 name: "sign-ext",
             },
         ];
         let features_b = [WasmTargetFeature {
-            prefix: TARGET_FEATURE_PREFIX_USED,
+            prefix: object::wasm::FEATURE_PREFIX_USED,
             name: "sign-ext",
         }];
         let inputs = [
@@ -8041,11 +8050,11 @@ mod tests {
     #[test]
     fn target_features_errors_when_used_and_disallowed_conflict() {
         let used = [WasmTargetFeature {
-            prefix: TARGET_FEATURE_PREFIX_USED,
+            prefix: object::wasm::FEATURE_PREFIX_USED,
             name: "atomics",
         }];
         let disallowed = [WasmTargetFeature {
-            prefix: TARGET_FEATURE_PREFIX_DISALLOWED,
+            prefix: object::wasm::FEATURE_PREFIX_DISALLOWED,
             name: "atomics",
         }];
         let inputs = [
@@ -8069,9 +8078,9 @@ mod tests {
         ];
         let features = parse_target_features_payload(payload).unwrap();
         assert_eq!(features.len(), 2);
-        assert_eq!(features[0].prefix, TARGET_FEATURE_PREFIX_USED);
+        assert_eq!(features[0].prefix, object::wasm::FEATURE_PREFIX_USED);
         assert_eq!(features[0].name, "bulk-memory");
-        assert_eq!(features[1].prefix, TARGET_FEATURE_PREFIX_DISALLOWED);
+        assert_eq!(features[1].prefix, object::wasm::FEATURE_PREFIX_DISALLOWED);
         assert_eq!(features[1].name, "atomics");
     }
 

@@ -9,8 +9,6 @@ use crate::layout::Layout;
 use crate::platform::Arch;
 use crate::timing_phase;
 use crate::verbose_timing_phase;
-use crate::wasm::WASM_MAGIC;
-use crate::wasm::WASM_VERSION;
 use crate::wasm::Wasm;
 use crate::wasm::WasmDataSegmentLayout;
 use crate::wasm::WasmFunctionBody;
@@ -21,7 +19,6 @@ use crate::wasm::WasmSymbol;
 use crate::wasm::apply_relocation;
 use crate::wasm::finalize_reloc_value;
 use crate::wasm::output_section_id;
-use crate::wasm::section_id;
 use crate::wasm::write_sleb128;
 use crate::wasm::write_uleb128;
 use leb128::write::unsigned_len as uleb128_size;
@@ -97,8 +94,8 @@ pub(crate) fn write<'data, A: Arch<Platform = Wasm>>(
         .get_mut(crate::output_section_id::FILE_HEADER)
         .get_mut(..8)
         .ok_or_else(|| crate::error!("Wasm output buffer is shorter than the 8-byte preamble"))?;
-    preamble[..4].copy_from_slice(&WASM_MAGIC);
-    preamble[4..8].copy_from_slice(&WASM_VERSION.to_le_bytes());
+    preamble[..4].copy_from_slice(&object::wasm::MAGIC);
+    preamble[4..8].copy_from_slice(&object::wasm::VERSION.to_le_bytes());
 
     if let Some(unsupported) = layout.format_specific.unsupported_output.first() {
         bail!("Wasm {unsupported} emission is not implemented yet");
@@ -218,7 +215,7 @@ fn write_code_section(wasm_layout: &WasmLayout<'_>, out: &mut [u8]) -> Result<()
     let mut pos = 0;
 
     // Section id.
-    out[pos] = section_id::CODE;
+    out[pos] = object::wasm::SEC_CODE.0;
     pos += 1;
 
     let count = bodies.len() as u64;
@@ -322,7 +319,7 @@ fn write_data_section(wasm_layout: &WasmLayout<'_>, out: &mut [u8]) -> Result<()
     );
 
     let mut pos = 0;
-    out[pos] = section_id::DATA;
+    out[pos] = object::wasm::SEC_DATA.0;
     pos += 1;
 
     let segments_total: u64 = flat

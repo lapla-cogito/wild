@@ -854,7 +854,7 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "wasm-encoder",
- "wasmparser",
+ "wasmparser 0.259.0",
  "winnow",
  "zerocopy",
  "zlib-rs",
@@ -1211,8 +1211,7 @@ dependencies = [
 [[package]]
 name = "object"
 version = "0.40.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dd229a0361b9d0d4396176e02d65897f487eebeab7caa6d443855ee152ca0b9c"
+source = "git+https://github.com/lapla-cogito/object?rev=325351fe74fd081b381b8898459d4e215fae8d6d#325351fe74fd081b381b8898459d4e215fae8d6d"
 dependencies = [
  "crc32fast",
  "flate2",
@@ -1220,6 +1219,7 @@ dependencies = [
  "indexmap",
  "memchr",
  "ruzstd",
+ "wasmparser 0.255.0",
 ]
 
 [[package]]
@@ -2067,6 +2067,15 @@ dependencies = [
 
 [[package]]
 name = "wasmparser"
+version = "0.255.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e8e329ef4b5d46e73b91d3ac6924417cad55a8cbbf869c199283383427c3320b"
+dependencies = [
+ "bitflags",
+]
+
+[[package]]
+name = "wasmparser"
 version = "0.259.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0f7c12eac7bb587801590f6a67ff0bc84d0748513864b71108e4b311cc3df694"
@@ -2124,7 +2133,7 @@ dependencies = [
  "tempfile",
  "toml",
  "wait-timeout",
- "wasmparser",
+ "wasmparser 0.259.0",
  "which",
 ]
 

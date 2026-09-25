@@ -90,7 +90,7 @@ nix = { version = "0.31.1", default-features = false, features = [
   "resource",
   "fs",
 ] }
-object = { version = "0.40.0", default-features = false, features = [
+object = { git = "https://github.com/lapla-cogito/object", rev = "325351fe74fd081b381b8898459d4e215fae8d6d", default-features = false, features = [
   # Note that compression is only actually needed for linker-diff
   "compression",
   "elf",
@@ -100,6 +100,7 @@ object = { version = "0.40.0", default-features = false, features = [
   "unaligned",
   "archive",
   "names",
+  "wasm",
 ] }
 os_info = { version = "3.1.0", default-features = false }
 paste = { version = "1.0.15", default-features = false }
