@@ -1,6 +1,6 @@
 [package]
 name = "libwild"
-description = "A library that provides a fast Linux linker"
+description = "A library that provides a fast linker for Linux and WebAssembly"
 version.workspace = true
 license.workspace = true
 repository.workspace = true

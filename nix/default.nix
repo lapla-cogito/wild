@@ -89,7 +89,7 @@ craneLib.buildPackage (
 
     meta = {
       changelog = "https://github.com/wild-linker/wild/blob/${commonArgs.version}/CHANGELOG.md";
-      description = "A very fast linker for Linux";
+      description = "A very fast linker for Linux and WebAssembly";
       homepage = "https://github.com/wild-linker/wild";
       license = [
         lib.licenses.asl20 # or
