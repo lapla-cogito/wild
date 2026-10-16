@@ -57,7 +57,7 @@ which.workspace = true
 wait-timeout.workspace = true
 
 [features]
-default = ["fork", "plugins", "zstd"]
+default = ["fork", "plugins", "wasm", "zstd"]
 
 fork = ["libwild/fork"]
 

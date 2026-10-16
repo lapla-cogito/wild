@@ -87,7 +87,7 @@ perfetto = ["perfetto-recorder/enable", "tracing/release_max_level_info"]
 # Enable work-in-progress features
 wip = []
 
-# Experimental support for linking WebAssembly. Currently incomplete.
+# WebAssembly support.
 wasm = []
 
 # Experimental support for linking Mach-O. Currently incomplete.
