@@ -941,7 +941,9 @@ pub(crate) fn encode_metadata_sections(
     {
         timing_phase!("Encode Wasm name section");
         if !strip_all && let Some(name_section) = build_name_section(layout) {
+            timing_phase!("Encode Wasm name custom section");
             encoded.name = Some(encode_wasm_section(&name_section));
+            drop(name_section);
         }
     }
 
@@ -1036,147 +1038,156 @@ fn build_name_section(layout: &WasmLayout<'_>) -> Option<NameSection> {
     let mut got_mem_names: Vec<String> = Vec::new();
     let mut got_func_names: Vec<String> = Vec::new();
 
-    // Host / remaining imports.
-    let mut next_func_import = 0u32;
-    let mut next_global_import = 0u32;
-    for import in &layout.imports {
-        match import.entity {
-            OutputImportEntity::Function { .. } => {
-                set_name_first_wins(&mut function_names, next_func_import, import.name);
-                next_func_import += 1;
-            }
-            OutputImportEntity::Global(_) => {
-                set_name_first_wins(&mut global_names, next_global_import, import.name);
-                next_global_import += 1;
-            }
-            OutputImportEntity::Memory(_) => {}
-        }
-    }
-
-    // Linker-synthesised functions / globals.
-    if let Some(idx) = names.memory_base_global {
-        set_name_first_wins(&mut global_names, idx, "__memory_base");
-    }
-    if let Some(idx) = names.table_base_global {
-        set_name_first_wins(&mut global_names, idx, "__table_base");
-    }
-    if let Some(idx) = names.stack_pointer_global {
-        set_name_first_wins(&mut global_names, idx, "__stack_pointer");
-    }
-    if let Some(idx) = names.tls_base_global {
-        set_name_first_wins(&mut global_names, idx, "__tls_base");
-    }
-    if let Some(idx) = names.tls_size_global {
-        set_name_first_wins(&mut global_names, idx, "__tls_size");
-    }
-    if let Some(idx) = names.tls_align_global {
-        set_name_first_wins(&mut global_names, idx, "__tls_align");
-    }
-    for &(known, idx) in &names.data_address_globals {
-        set_name_first_wins(&mut global_names, idx, <&str>::from(known));
-    }
-    if let Some(got_base) = names.got_mem_global_base {
-        got_mem_names.reserve(names.got_mem.len());
-        for (i, source) in names.got_mem.iter().enumerate() {
-            let name = match *source {
-                WasmGotMemSource::Symbol(Some(sym)) => format!(
-                    "GOT.data.internal.{}",
-                    demangle_symbol_name(sym, names.demangle)
-                ),
-                WasmGotMemSource::Symbol(None) => format!("GOT.data.internal.{i}"),
-                WasmGotMemSource::LinkerDefined(known) => {
-                    let sym = std::str::from_utf8(known.name()).unwrap_or("?");
-                    format!("GOT.data.internal.{sym}")
+    // Host / remaining imports, then linker-synthesised names.
+    {
+        timing_phase!("Assign Wasm linker names");
+        let mut next_func_import = 0u32;
+        let mut next_global_import = 0u32;
+        for import in &layout.imports {
+            match import.entity {
+                OutputImportEntity::Function { .. } => {
+                    set_name_first_wins(&mut function_names, next_func_import, import.name);
+                    next_func_import += 1;
                 }
-            };
-            got_mem_names.push(name);
+                OutputImportEntity::Global(_) => {
+                    set_name_first_wins(&mut global_names, next_global_import, import.name);
+                    next_global_import += 1;
+                }
+                OutputImportEntity::Memory(_) => {}
+            }
         }
-        for (i, name) in got_mem_names.iter().enumerate() {
-            set_name_first_wins(&mut global_names, got_base + i as u32, name.as_str());
-        }
-    }
-    if let Some(got_base) = names.got_func_global_base {
-        got_func_names.reserve(names.got_func_names.len());
-        for (i, name) in names.got_func_names.iter().enumerate() {
-            got_func_names.push(match name {
-                Some(name) => format!(
-                    "GOT.func.internal.{}",
-                    demangle_symbol_name(name, names.demangle)
-                ),
-                None => format!("GOT.func.internal.{i}"),
-            });
-        }
-        for (i, name) in got_func_names.iter().enumerate() {
-            set_name_first_wins(&mut global_names, got_base + i as u32, name.as_str());
-        }
-    }
-    if let Some(idx) = names.call_ctors_func {
-        set_name_first_wins(&mut function_names, idx, "__wasm_call_ctors");
-    }
-    if let Some(idx) = names.init_tls_func {
-        set_name_first_wins(&mut function_names, idx, "__wasm_init_tls");
-    }
-    if let Some(idx) = names.init_memory_func {
-        set_name_first_wins(&mut function_names, idx, "__wasm_init_memory");
-    }
 
-    let per_object_names: Vec<ObjectNameEntries<'_>> = layout
-        .per_object_data
-        .par_iter()
-        .zip(layout.per_object_symbols.par_iter())
-        .zip(layout.object_index_maps.par_iter())
-        .map(|((data, symbols), index_map)| {
-            verbose_timing_phase!("Collect Wasm object name entries");
-            let mut entries = ObjectNameEntries::default();
-            for sym in *symbols {
-                let Some(name) = wasm_symbol_name_str(data, sym) else {
-                    continue;
+        // Linker-synthesised functions / globals.
+        if let Some(idx) = names.memory_base_global {
+            set_name_first_wins(&mut global_names, idx, "__memory_base");
+        }
+        if let Some(idx) = names.table_base_global {
+            set_name_first_wins(&mut global_names, idx, "__table_base");
+        }
+        if let Some(idx) = names.stack_pointer_global {
+            set_name_first_wins(&mut global_names, idx, "__stack_pointer");
+        }
+        if let Some(idx) = names.tls_base_global {
+            set_name_first_wins(&mut global_names, idx, "__tls_base");
+        }
+        if let Some(idx) = names.tls_size_global {
+            set_name_first_wins(&mut global_names, idx, "__tls_size");
+        }
+        if let Some(idx) = names.tls_align_global {
+            set_name_first_wins(&mut global_names, idx, "__tls_align");
+        }
+        for &(known, idx) in &names.data_address_globals {
+            set_name_first_wins(&mut global_names, idx, <&str>::from(known));
+        }
+        if let Some(got_base) = names.got_mem_global_base {
+            got_mem_names.reserve(names.got_mem.len());
+            for (i, source) in names.got_mem.iter().enumerate() {
+                let name = match *source {
+                    WasmGotMemSource::Symbol(Some(sym)) => format!(
+                        "GOT.data.internal.{}",
+                        demangle_symbol_name(sym, names.demangle)
+                    ),
+                    WasmGotMemSource::Symbol(None) => format!("GOT.data.internal.{i}"),
+                    WasmGotMemSource::LinkerDefined(known) => {
+                        let sym = std::str::from_utf8(known.name()).unwrap_or("?");
+                        format!("GOT.data.internal.{sym}")
+                    }
                 };
-                match sym.kind {
-                    WasmSymbolKind::Func
-                        if let Some(&out_idx) =
-                            index_map.function_indices.get(sym.index as usize)
-                            && out_idx != WASM_DEAD_INDEX =>
-                    {
-                        entries.functions.push((out_idx, name));
+                got_mem_names.push(name);
+            }
+            for (i, name) in got_mem_names.iter().enumerate() {
+                set_name_first_wins(&mut global_names, got_base + i as u32, name.as_str());
+            }
+        }
+        if let Some(got_base) = names.got_func_global_base {
+            got_func_names.reserve(names.got_func_names.len());
+            for (i, name) in names.got_func_names.iter().enumerate() {
+                got_func_names.push(match name {
+                    Some(name) => format!(
+                        "GOT.func.internal.{}",
+                        demangle_symbol_name(name, names.demangle)
+                    ),
+                    None => format!("GOT.func.internal.{i}"),
+                });
+            }
+            for (i, name) in got_func_names.iter().enumerate() {
+                set_name_first_wins(&mut global_names, got_base + i as u32, name.as_str());
+            }
+        }
+        if let Some(idx) = names.call_ctors_func {
+            set_name_first_wins(&mut function_names, idx, "__wasm_call_ctors");
+        }
+        if let Some(idx) = names.init_tls_func {
+            set_name_first_wins(&mut function_names, idx, "__wasm_init_tls");
+        }
+        if let Some(idx) = names.init_memory_func {
+            set_name_first_wins(&mut function_names, idx, "__wasm_init_memory");
+        }
+    }
+
+    let per_object_names: Vec<ObjectNameEntries<'_>> = {
+        timing_phase!("Collect Wasm object names");
+        layout
+            .per_object_data
+            .par_iter()
+            .zip(layout.per_object_symbols.par_iter())
+            .zip(layout.object_index_maps.par_iter())
+            .map(|((data, symbols), index_map)| {
+                verbose_timing_phase!("Collect Wasm object name entries");
+                let mut entries = ObjectNameEntries::default();
+                for sym in *symbols {
+                    let Some(name) = wasm_symbol_name_str(data, sym) else {
+                        continue;
+                    };
+                    match sym.kind {
+                        WasmSymbolKind::Func
+                            if let Some(&out_idx) =
+                                index_map.function_indices.get(sym.index as usize)
+                                && out_idx != WASM_DEAD_INDEX =>
+                        {
+                            entries.functions.push((out_idx, name));
+                        }
+                        WasmSymbolKind::Global
+                            if let Some(&out_idx) =
+                                index_map.global_indices.get(sym.index as usize)
+                                && out_idx != WASM_DEAD_INDEX =>
+                        {
+                            entries.globals.push((out_idx, name));
+                        }
+                        _ => {}
                     }
-                    WasmSymbolKind::Global
-                        if let Some(&out_idx) =
-                            index_map.global_indices.get(sym.index as usize)
-                            && out_idx != WASM_DEAD_INDEX =>
-                    {
-                        entries.globals.push((out_idx, name));
-                    }
-                    _ => {}
                 }
+                entries
+            })
+            .collect()
+    };
+    {
+        timing_phase!("Fill Wasm name table");
+        for entries in per_object_names {
+            for (out_idx, name) in entries.functions {
+                set_name_first_wins(&mut function_names, out_idx, name);
             }
-            entries
-        })
-        .collect();
-    for entries in per_object_names {
-        for (out_idx, name) in entries.functions {
-            set_name_first_wins(&mut function_names, out_idx, name);
+            for (out_idx, name) in entries.globals {
+                set_name_first_wins(&mut global_names, out_idx, name);
+            }
         }
-        for (out_idx, name) in entries.globals {
-            set_name_first_wins(&mut global_names, out_idx, name);
+
+        // Named after object symbols so first-wins keeps `{export}.command_export` rather than the
+        // export name that is retargeted onto the wrapper.
+        for (idx, name) in &layout.command_export_wrapper_names {
+            set_name_first_wins(&mut function_names, *idx, name.as_str());
         }
-    }
 
-    // Named after object symbols so first-wins keeps `{export}.command_export` rather than the
-    // export name that is retargeted onto the wrapper.
-    for (idx, name) in &layout.command_export_wrapper_names {
-        set_name_first_wins(&mut function_names, *idx, name.as_str());
-    }
-
-    for export in &layout.exports {
-        match export.kind {
-            wasmparser::ExternalKind::Func => {
-                set_name_first_wins(&mut function_names, export.index, export.name);
+        for export in &layout.exports {
+            match export.kind {
+                wasmparser::ExternalKind::Func => {
+                    set_name_first_wins(&mut function_names, export.index, export.name);
+                }
+                wasmparser::ExternalKind::Global => {
+                    set_name_first_wins(&mut global_names, export.index, export.name);
+                }
+                _ => {}
             }
-            wasmparser::ExternalKind::Global => {
-                set_name_first_wins(&mut global_names, export.index, export.name);
-            }
-            _ => {}
         }
     }
 
@@ -1186,13 +1197,19 @@ fn build_name_section(layout: &WasmLayout<'_>) -> Option<NameSection> {
         return None;
     }
 
-    let mut section = NameSection::new();
-    if let Some(map) = function_map {
-        section.functions(&map);
-    }
-    if let Some(map) = global_map {
-        section.globals(&map);
-    }
+    let section = {
+        timing_phase!("Write Wasm name subsections");
+        let mut section = NameSection::new();
+        if let Some(map) = function_map {
+            section.functions(&map);
+            drop(map);
+        }
+        if let Some(map) = global_map {
+            section.globals(&map);
+            drop(map);
+        }
+        section
+    };
     Some(section)
 }
 
@@ -1213,21 +1230,30 @@ fn name_map_from_dense(names: &[Option<&str>], demangle: bool) -> Option<NameMap
     let mut map = NameMap::new();
     if demangle {
         // `NameMap::append` needs ascending indices, so only demangling runs in parallel.
-        let demangled: Vec<Option<Cow<'_, str>>> = names
-            .par_iter()
-            .map(|name| {
-                name.map(|name| {
-                    verbose_timing_phase!("Demangle Wasm symbol name");
-                    demangle_symbol_name(name, true)
+        let demangled: Vec<Option<Cow<'_, str>>> = {
+            timing_phase!("Demangle Wasm names");
+            names
+                .par_iter()
+                .map(|name| {
+                    name.map(|name| {
+                        verbose_timing_phase!("Demangle Wasm symbol name");
+                        demangle_symbol_name(name, true)
+                    })
                 })
-            })
-            .collect();
-        for (idx, name) in demangled.iter().enumerate() {
-            if let Some(name) = name {
-                map.append(idx as u32, name);
+                .collect()
+        };
+        {
+            timing_phase!("Append Wasm name map");
+            for (idx, name) in demangled.iter().enumerate() {
+                if let Some(name) = name {
+                    map.append(idx as u32, name);
+                }
             }
+            // Free the demangled strings inside this span.
+            drop(demangled);
         }
     } else {
+        timing_phase!("Append Wasm name map");
         for (idx, name) in names.iter().enumerate() {
             if let Some(name) = name {
                 map.append(idx as u32, name);
