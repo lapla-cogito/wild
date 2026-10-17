@@ -1215,7 +1215,12 @@ fn name_map_from_dense(names: &[Option<&str>], demangle: bool) -> Option<NameMap
         // `NameMap::append` needs ascending indices, so only demangling runs in parallel.
         let demangled: Vec<Option<Cow<'_, str>>> = names
             .par_iter()
-            .map(|name| name.map(|name| demangle_symbol_name(name, true)))
+            .map(|name| {
+                name.map(|name| {
+                    verbose_timing_phase!("Demangle Wasm symbol name");
+                    demangle_symbol_name(name, true)
+                })
+            })
             .collect();
         for (idx, name) in demangled.iter().enumerate() {
             if let Some(name) = name {
