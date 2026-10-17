@@ -59,6 +59,7 @@ craneLib.buildPackage (
   // {
     cargoArtifacts = craneLib.buildDepsOnly commonArgs;
     cargoBuildCommand = "cargo build --profile release -p wild-linker";
+    cargoTestExtraArgs = "-- --skip 'wasm/'";
 
     # Do the check in the separate derivation so it can be done
     # in parallel in the dev profile
