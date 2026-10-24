@@ -12,11 +12,20 @@ body = """
 {% endif %}\
 {% for group, commits in commits | group_by(attribute="group") %}
     ### {{ group | striptags | trim | upper_first }}
-    {% for commit in commits %}
-        - {% if commit.scope %}*({{ commit.scope }})* {% endif %}\
-            {% if commit.breaking %}[**breaking**] {% endif %}\
-            {{ commit.message | upper_first }}\
-    {% endfor %}
+
+    {% for commit in commits -%}
+        {%- if commit.scope | default(value="") | lower != "wasm" -%}
+            - {% if commit.scope %}*({{ commit.scope }})* {% endif %}\
+                {% if commit.breaking %}[**breaking**] {% endif %}\
+                {{ commit.message | upper_first }}
+        {% endif %}
+    {%- endfor -%}
+    {% for commit in commits -%}
+        {%- if commit.scope | default(value="") | lower == "wasm" -%}
+            - *(wasm)* {% if commit.breaking %}[**breaking**] {% endif %}\
+                {{ commit.message | upper_first }}
+        {% endif %}
+    {%- endfor -%}
 {% endfor %}
 """
 # Remove leading and trailing whitespaces from the changelog's body.
@@ -67,6 +76,7 @@ commit_parsers = [
   { message = "^fix", group = "<!-- 03 -->🪲 Bug Fixes" },
   { message = "^build", group = "<! -- 04 -->🏗️ Builds" },
   { message = "^doc", group = "<!-- 05 -->📚 Documentation" },
+  # Older Wasm commits use port(wasm) and still land in this group.
   { message = "^port\\(wasm", group = "<!-- 06 -->🕹️ Porting (Wasm)" },
   { message = "^port\\(MachO", group = "<!-- 07 -->🕹️ Porting (Mach-O)" },
   { message = "^port", group = "<!-- 08 -->🕹️ Porting (other)" },
