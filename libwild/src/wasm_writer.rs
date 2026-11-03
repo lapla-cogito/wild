@@ -29,7 +29,6 @@ use crate::wasm::WasmSymbolKind;
 use crate::wasm::count_output_imports;
 use crate::wasm::deferred_tls_template_pointer;
 use crate::wasm::demangle_symbol_name;
-use crate::wasm::output_data_has_passive;
 use crate::wasm::output_data_segment_count;
 use crate::wasm::output_section_id;
 use crate::wasm::relocation_type_to_string;
@@ -432,11 +431,8 @@ fn write_code_section(wasm_layout: &WasmLayout<'_>, out: &mut [u8]) -> Result<()
 }
 
 fn write_data_section(wasm_layout: &WasmLayout<'_>, out: &mut [u8]) -> Result<()> {
-    let object_data_layouts = &wasm_layout.object_data_layouts;
-    let segment_count: u32 = object_data_layouts
-        .iter()
-        .map(|obj| u32::try_from(obj.len()).unwrap_or(u32::MAX))
-        .sum();
+    let segments = &wasm_layout.output_data_segments;
+    let segment_count = u32::try_from(segments.len()).unwrap_or(u32::MAX);
     if segment_count == 0 {
         ensure!(
             out.is_empty(),
@@ -446,24 +442,13 @@ fn write_data_section(wasm_layout: &WasmLayout<'_>, out: &mut [u8]) -> Result<()
         return Ok(());
     }
 
-    // Flatten (object_index, segment) for parallel emit. Header is serial.
-    let flat: Vec<(usize, &WasmDataSegmentLayout<'_>)> = object_data_layouts
-        .iter()
-        .enumerate()
-        .flat_map(|(obj_idx, segs)| segs.iter().map(move |seg| (obj_idx, seg)))
-        .collect();
-    ensure!(
-        flat.len() == segment_count as usize,
-        "Wasm data segment count mismatch"
-    );
-
     let mut pos = 0;
     out[pos] = section_id::DATA;
     pos += 1;
 
-    let segments_total: u64 = flat
+    let segments_total: u64 = segments
         .iter()
-        .map(|(_, seg)| u64::from(seg.encoded_output_size))
+        .map(|segment| u64::from(segment.encoded_output_size))
         .sum();
     let count_leb_size = uleb128_size(u64::from(segment_count));
     let payload_size = count_leb_size as u64 + segments_total;
@@ -471,19 +456,12 @@ fn write_data_section(wasm_layout: &WasmLayout<'_>, out: &mut [u8]) -> Result<()
     pos += write_uleb128(&mut out[pos..], u64::from(segment_count));
     let segments_region_start = pos;
 
-    let object_index_maps = &wasm_layout.object_index_maps;
-    let object_data_relocations = &wasm_layout.object_data_relocations;
-    let per_object_symbols = &wasm_layout.per_object_symbols;
-    let function_table_slots = &wasm_layout.function_table_slots;
-    let memory_base = wasm_layout.memory_base;
-    let tls_base = wasm_layout.tls_base;
-
-    let mut segment_slots: Vec<(&mut [u8], usize, &WasmDataSegmentLayout<'_>)> =
-        Vec::with_capacity(flat.len());
+    let mut segment_slots: Vec<(&mut [u8], &crate::wasm::OutputDataSegment)> =
+        Vec::with_capacity(segments.len());
     {
         verbose_timing_phase!("Split Wasm data segment slots");
         let mut rest = &mut out[segments_region_start..];
-        for (obj_idx, segment) in flat {
+        for segment in segments {
             let slot_len = segment.encoded_output_size as usize;
             ensure!(
                 rest.len() >= slot_len,
@@ -491,7 +469,7 @@ fn write_data_section(wasm_layout: &WasmLayout<'_>, out: &mut [u8]) -> Result<()
                 rest.len()
             );
             let (slot, next) = rest.split_at_mut(slot_len);
-            segment_slots.push((slot, obj_idx, segment));
+            segment_slots.push((slot, segment));
             rest = next;
         }
         ensure!(
@@ -501,20 +479,27 @@ fn write_data_section(wasm_layout: &WasmLayout<'_>, out: &mut [u8]) -> Result<()
         );
     }
 
+    let object_data_layouts = &wasm_layout.object_data_layouts;
+    let object_index_maps = &wasm_layout.object_index_maps;
+    let object_data_relocations = &wasm_layout.object_data_relocations;
+    let per_object_symbols = &wasm_layout.per_object_symbols;
+    let function_table_slots = &wasm_layout.function_table_slots;
+    let memory_base = wasm_layout.memory_base;
+    let tls_base = wasm_layout.tls_base;
+
     {
         verbose_timing_phase!("Emit Wasm data segments");
         segment_slots
             .into_par_iter()
-            .try_for_each(|(slot, obj_idx, segment)| -> Result<()> {
+            .try_for_each(|(slot, segment)| -> Result<()> {
                 verbose_timing_phase!("Emit Wasm data segment");
-                write_data_segment(
+                write_output_data_segment(
                     slot,
                     segment,
-                    &object_index_maps[obj_idx],
-                    object_data_relocations
-                        .get(obj_idx)
-                        .map_or(&[][..], Vec::as_slice),
-                    per_object_symbols[obj_idx],
+                    object_data_layouts,
+                    object_index_maps,
+                    object_data_relocations,
+                    per_object_symbols,
                     function_table_slots,
                     memory_base,
                     tls_base,
@@ -525,12 +510,13 @@ fn write_data_section(wasm_layout: &WasmLayout<'_>, out: &mut [u8]) -> Result<()
     Ok(())
 }
 
-fn write_data_segment(
+fn write_output_data_segment(
     out: &mut [u8],
-    segment: &WasmDataSegmentLayout<'_>,
-    index_map: &WasmObjectIndexMap,
-    object_relocs: &[WasmRelocation],
-    symbols: &[WasmSymbol],
+    segment: &crate::wasm::OutputDataSegment,
+    layouts: &[Vec<WasmDataSegmentLayout<'_>>],
+    index_maps: &[WasmObjectIndexMap],
+    relocs: &[Vec<WasmRelocation>],
+    symbols: &[&[WasmSymbol]],
     function_table_slots: &[u32],
     memory_base: u32,
     tls_base: u32,
@@ -557,24 +543,36 @@ fn write_data_segment(
         pos = write_active_offset_expr(out, pos, segment.output_memory_offset)?;
     }
 
-    let data_len = segment.data.len() as u64;
-    pos += write_uleb128(&mut out[pos..], data_len);
-    let payload = &mut out[pos..pos + segment.data.len()];
-    payload.copy_from_slice(segment.data);
-    for reloc in relocs_in_index_range(object_relocs, segment.reloc_range.clone()) {
-        apply_section_reloc(
-            index_map,
-            reloc,
-            segment.payload_start,
-            symbols,
-            function_table_slots,
-            memory_base,
-            tls_base,
-            segment.tls_template,
-            payload,
-        )?;
+    let payload_len = segment.payload_len as usize;
+    pos += write_uleb128(&mut out[pos..], segment.payload_len as u64);
+    {
+        let payload = &mut out[pos..pos + payload_len];
+        payload.fill(0);
+        for piece_ref in &segment.pieces {
+            let piece = &layouts[piece_ref.object_index][piece_ref.piece_index];
+            let start = piece_ref.payload_offset as usize;
+            let end = start + piece.data.len();
+            payload[start..end].copy_from_slice(piece.data);
+            let object_relocs = relocs
+                .get(piece_ref.object_index)
+                .map_or(&[][..], Vec::as_slice);
+            let piece_buf = &mut payload[start..end];
+            for reloc in relocs_in_index_range(object_relocs, piece.reloc_range.clone()) {
+                apply_section_reloc(
+                    &index_maps[piece_ref.object_index],
+                    reloc,
+                    piece.payload_start,
+                    symbols[piece_ref.object_index],
+                    function_table_slots,
+                    memory_base,
+                    tls_base,
+                    piece.tls_template,
+                    piece_buf,
+                )?;
+            }
+        }
     }
-    pos += segment.data.len();
+    pos += payload_len;
 
     ensure!(
         pos == out.len(),
@@ -963,9 +961,9 @@ pub(crate) fn encode_metadata_sections(
         // Validators reject `memory.init` / `data.drop` without this section. A remaining
         // passive segment emits it too.
         if layout.code_references_data_segment
-            || output_data_has_passive(&layout.object_data_layouts)
+            || layout.output_data_segments.iter().any(|segment| segment.passive)
         {
-            let count = output_data_segment_count(&layout.object_data_layouts);
+            let count = output_data_segment_count(&layout.output_data_segments);
             encoded.data_count = Some(encode_wasm_section(&wasm_encoder::DataCountSection {
                 count,
             }));
