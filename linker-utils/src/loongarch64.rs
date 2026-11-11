@@ -755,6 +755,57 @@ impl LoongArch64Instruction {
     }
 }
 
+/// Padding described by an `R_LARCH_ALIGN` relocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LarchAlign {
+    pub alignment: u64,
+    pub nop_bytes: u64,
+    pub max_bytes: u64,
+}
+
+/// Decode an `R_LARCH_ALIGN` addend.
+#[must_use]
+pub fn decode_larch_align(has_symbol: bool, addend: u64) -> Option<LarchAlign> {
+    let (alignment, max_bytes) = if has_symbol {
+        let log = addend & 0xff;
+        if !(2..63).contains(&log) {
+            return None;
+        }
+        (1u64 << log, addend >> 8)
+    } else if addend == 0 {
+        return None;
+    } else {
+        let mut alignment = 1u64;
+        while alignment <= addend {
+            alignment = alignment.checked_shl(1)?;
+        }
+        (alignment, 0)
+    };
+    if alignment < 4 {
+        return None;
+    }
+    Some(LarchAlign {
+        alignment,
+        nop_bytes: alignment - 4,
+        max_bytes,
+    })
+}
+
+/// Bytes to delete from the front of an `R_LARCH_ALIGN` sled placed at `loc`.
+#[must_use]
+pub fn larch_align_bytes_to_remove(loc: u64, info: LarchAlign) -> u32 {
+    let off = loc & (info.alignment - 1);
+    let keep = if off == 0 { 0 } else { info.alignment - off };
+    let remove = if info.max_bytes != 0 && keep > info.max_bytes {
+        info.nop_bytes
+    } else if keep >= info.nop_bytes {
+        0
+    } else {
+        info.nop_bytes - keep
+    };
+    u32::try_from(remove).unwrap_or(0)
+}
+
 // Documentation definition:
 // (*(uint32_t *) PC) [24 ... 5] = (((S+A+0x8000'0000 + (((S+A) & 0x800) ?
 // (0x1000-0x1'0000'0000) : 0)) & ~0xfff) - (PC-8 & ~0xfff)) [51 ... 32]

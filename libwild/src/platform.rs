@@ -204,6 +204,27 @@ pub(crate) trait Arch: Send + Sync + 'static {
         false
     }
 
+    /// Size-reducing relaxations that stay enabled with `--no-relax`.
+    ///
+    /// LoongArch `R_LARCH_ALIGN` is one of these. The assembler emits the worst-case NOP sled, and
+    /// the following instruction is aligned only after the linker deletes the excess. BFD and LLD
+    /// do that even when `--no-relax` is set. Partial linking still skips the deletion so a later
+    /// link can trim the sled. An architecture that returns true must implement
+    /// [`Self::collect_relaxation_deltas`].
+    fn performs_mandatory_size_relaxations() -> bool {
+        false
+    }
+
+    /// `collect_relaxation_deltas` returns the section's entire deletion set.
+    ///
+    /// The caller replaces counts stored by an earlier pass and changes the section size by the
+    /// difference. LoongArch alignment needs this: a later section is placed after the previous
+    /// section's relaxed size, so a count chosen from the unrelaxed address is wrong once that
+    /// size changes.
+    fn replaces_relaxation_deltas() -> bool {
+        false
+    }
+
     /// Returns true if the given relocation type cannot be used against interposable symbols.
     /// This includes preemptible symbols in shared objects and DSO-provided symbols in
     /// executables. On 64-bit architectures, sub-pointer-size absolute and PC-relative
@@ -248,8 +269,9 @@ pub(crate) trait Arch: Send + Sync + 'static {
         _existing_deltas: Option<&SectionRelaxDeltas>,
         _resolve_symbol: impl FnMut(object::SymbolIndex) -> Option<RelaxSymbolInfo>,
     ) -> (Vec<(u64, u32)>, Option<u64>) {
-        // This function should not be called unless `supports_size_reduction_relaxations` returns
-        // true in which case this function should be implemented.
+        // This function should not be called unless `supports_size_reduction_relaxations` or
+        // `performs_mandatory_size_relaxations` returns true, in which case this function should
+        // be implemented.
         unreachable!();
     }
 

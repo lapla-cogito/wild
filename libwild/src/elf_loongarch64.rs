@@ -1,10 +1,15 @@
 use crate::bail;
 use crate::elf::Elf64;
+use crate::elf::ElfCrel;
+use crate::elf::ElfRela;
 use crate::elf::PLT_ENTRY_SIZE;
+use crate::elf::RelocationList64;
 use crate::error::Context as _;
 use crate::error::Result;
 use crate::platform::Platform;
 use crate::platform::PreviousRelocationInfo;
+use crate::platform::RelaxSymbolInfo;
+use crate::platform::Relocation;
 use itertools::AllEqualValueError;
 use itertools::Itertools;
 use linker_utils::elf::DynamicRelocationKind;
@@ -15,7 +20,10 @@ use linker_utils::elf::SIZE_2KB;
 use linker_utils::elf::loongarch64_rel_type_to_string;
 use linker_utils::elf::shf;
 use linker_utils::loongarch64::RelaxationKind;
+use linker_utils::loongarch64::decode_larch_align;
+use linker_utils::loongarch64::larch_align_bytes_to_remove;
 use linker_utils::relaxation::RelocationModifier;
+use linker_utils::relaxation::SectionRelaxDeltas;
 use linker_utils::utils::or_from_slice;
 
 pub(crate) struct ElfLoongArch64;
@@ -109,6 +117,39 @@ impl crate::platform::Arch for ElfLoongArch64 {
 
     fn high_part_relocations() -> &'static [object::elf::RelocationType] {
         &[]
+    }
+
+    fn supports_size_reduction_relaxations() -> bool {
+        true
+    }
+
+    fn performs_mandatory_size_relaxations() -> bool {
+        true
+    }
+
+    fn replaces_relaxation_deltas() -> bool {
+        true
+    }
+
+    fn collect_relaxation_deltas(
+        section_output_address: u64,
+        section_bytes: &[u8],
+        relocations: RelocationList64,
+        _existing_deltas: Option<&SectionRelaxDeltas>,
+        _resolve_symbol: impl FnMut(object::SymbolIndex) -> Option<RelaxSymbolInfo>,
+    ) -> (Vec<(u64, u32)>, Option<u64>) {
+        match relocations {
+            RelocationList64::Rela(rela_list) => collect_relaxation_deltas(
+                section_output_address,
+                section_bytes,
+                rela_list.iter().copied().map(ElfRela::new),
+            ),
+            RelocationList64::Crel(crel_iter) => collect_relaxation_deltas(
+                section_output_address,
+                section_bytes,
+                crel_iter.flatten().map(ElfCrel::new),
+            ),
+        }
     }
 
     #[allow(unused_variables)]
@@ -207,4 +248,51 @@ impl crate::platform::Relaxation for Relaxation {
     fn is_mandatory(&self) -> bool {
         self.mandatory
     }
+}
+
+/// Recompute every `R_LARCH_ALIGN` sled from the section's current address.
+///
+/// The returned list is the full deletion set for this pass. Deletions earlier in the section are
+/// accounted for here. Counts stored by a previous pass are omitted, because the caller replaces
+/// them. A margin of zero requests another pass after any section changes size: a later input
+/// section moves when an earlier sled shrinks.
+fn collect_relaxation_deltas<R: Relocation<Platform = Elf64>>(
+    section_output_address: u64,
+    section_bytes: &[u8],
+    relocations: impl Iterator<Item = R>,
+) -> (Vec<(u64, u32)>, Option<u64>) {
+    let mut raw_deltas = Vec::new();
+    let mut new_cumulative_delta = 0u64;
+    let mut saw_align = false;
+
+    for rel in relocations {
+        if rel.raw_type() != object::elf::R_LARCH_ALIGN {
+            continue;
+        }
+        saw_align = true;
+        let input_offset = rel.offset();
+        let addend = rel.addend();
+        if addend < 0 {
+            continue;
+        }
+        let Some(info) = decode_larch_align(rel.symbol().is_some(), addend as u64) else {
+            continue;
+        };
+        let sled_end = input_offset.saturating_add(info.nop_bytes);
+        if sled_end > section_bytes.len() as u64 {
+            continue;
+        }
+
+        let output_offset = input_offset - new_cumulative_delta;
+        let loc = section_output_address + output_offset;
+        let remove = larch_align_bytes_to_remove(loc, info);
+        if remove == 0 {
+            continue;
+        }
+        raw_deltas.push((input_offset, remove));
+        new_cumulative_delta += u64::from(remove);
+    }
+
+    let margin = if saw_align { Some(0) } else { None };
+    (raw_deltas, margin)
 }

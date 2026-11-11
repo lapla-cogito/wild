@@ -229,6 +229,25 @@ impl RelaxDeltaMap {
         self.entries.insert(pos, (section_index, deltas));
     }
 
+    /// Inserts or overwrites the deltas for `section_index`.
+    pub fn replace(&mut self, section_index: usize, deltas: SectionRelaxDeltas) {
+        match self
+            .entries
+            .binary_search_by_key(&section_index, |(idx, _)| *idx)
+        {
+            Ok(pos) => self.entries[pos].1 = deltas,
+            Err(pos) => self.entries.insert(pos, (section_index, deltas)),
+        }
+    }
+
+    pub fn remove(&mut self, section_index: usize) -> Option<SectionRelaxDeltas> {
+        let pos = self
+            .entries
+            .binary_search_by_key(&section_index, |(idx, _)| *idx)
+            .ok()?;
+        Some(self.entries.remove(pos).1)
+    }
+
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
